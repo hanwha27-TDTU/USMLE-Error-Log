@@ -28,34 +28,42 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: #0f1623; min-height: 100vh; padding: 20px 16px; }
+    body {
+      background: #f0f4f8;
+      min-height: 100vh;
+      padding: 20px 16px;
+    }
     #root { max-width: 880px; margin: 0 auto; }
-    /* ── input / textarea / select global focus & placeholder ── */
+    /* ── input focus & placeholder ── */
     input:focus, textarea:focus, select:focus {
       outline: none !important;
-      border-color: rgba(251,191,36,0.65) !important;
-      box-shadow: 0 0 0 3px rgba(251,191,36,0.12) !important;
+      border-color: rgba(249,115,22,0.6) !important;
+      box-shadow: 0 0 0 3px rgba(249,115,22,0.10) !important;
     }
-    input::placeholder, textarea::placeholder { color: #4a5568; opacity:1; }
-    select option { background: #1d2843; color: #f1f5f9; }
+    input::placeholder, textarea::placeholder { color: #a0aec0; opacity:1; }
+    select option { background: #fff; color: #1e293b; }
+    /* ── uwn card lift ── */
+    .card-lift {
+      box-shadow: 0 1px 4px rgba(0,0,0,.07), 0 1px 2px rgba(0,0,0,.04);
+    }
     #confirm-overlay {
-      display:none; position:fixed; inset:0; background:rgba(0,0,0,.8);
+      display:none; position:fixed; inset:0; background:rgba(15,22,35,.55);
       z-index:9999; align-items:center; justify-content:center;
     }
     #confirm-overlay.open { display:flex; }
     #confirm-box {
-      background:#1d2435; border:1px solid rgba(148,163,184,0.22);
+      background:#ffffff; border:1px solid rgba(0,0,0,.10);
       border-radius:16px; padding:30px 26px; max-width:360px; width:90%;
       font-family: ui-sans-serif, system-ui, sans-serif;
-      box-shadow: 0 20px 60px rgba(0,0,0,.6);
+      box-shadow: 0 20px 60px rgba(0,0,0,.18);
     }
-    #confirm-msg { color:#f1f5f9; font-size:15px; line-height:1.65; margin-bottom:22px; }
+    #confirm-msg { color:#1e293b; font-size:15px; line-height:1.65; margin-bottom:22px; }
     #confirm-btns { display:flex; gap:10px; }
     #confirm-btns button { flex:1; border-radius:10px; padding:12px; font-size:14px;
       font-weight:700; cursor:pointer; border:none; font-family:inherit; }
-    #confirm-ok  { background:#fbbf24; color:#0f1623; }
-    #confirm-can { background:rgba(148,163,184,0.08); color:#94a3b8;
-      border:1px solid rgba(148,163,184,0.2) !important; }
+    #confirm-ok  { background:#f97316; color:#fff; }
+    #confirm-can { background:#f1f5f9; color:#64748b;
+      border:1px solid rgba(0,0,0,.10) !important; }
   </style>
 </head>
 <body>
@@ -300,7 +308,7 @@ Generate concise USMLE-style content. Respond ONLY with valid JSON (no markdown,
 {
   "pathophys": "1-2 line mechanism using up/down arrows (↑↓)",
   "trap": "why a student would pick the wrong answer instead of correct one",
-  "content_kr": "1-2 sentence Korean explanation (핵심만, 고득점 포인트)",
+  "content_kr": "한국어 기반 1-2문장 설명. 의학용어는 반드시 '한국어(English)' 병기 형식으로. 예: 신세관(Proximal Tubule) 손상 → 갈색 과립 원주(Muddy Brown Casts) 형성",
   "content_uz": "1-2 sentence Uzbek explanation (asosiy nuqta)",
   "content_en": "1-2 sentence English high-yield note",
   "buzzword": "comma-separated 2-4 USMLE buzzwords"
@@ -488,7 +496,7 @@ const SEED = [{
   buzzword: ['NKCC2', 'loop-diuretic mimic', 'hypercalciuria'],
   source: 'UWorld',
   confidence: 4,
-  content_kr: 'Bartter = loop(NKCC2) 결함. 고Ca²⁺뇨가 핵심 감별점.',
+  content_kr: '바터 증후군(Bartter Syndrome) = 헨레고리(Loop of Henle) NKCC2 결함. 고칼슘뇨(Hypercalciuria)가 핵심 감별점.',
   content_uz: 'Bartter = NKCC2 nuqson. Giperkalsiuriya — asosiy farq.',
   content_en: 'Bartter = NKCC2 defect (loop-diuretic mimic). Hypercalciuria distinguishes from Gitelman.',
   originalMcq: {
@@ -509,7 +517,7 @@ const SEED = [{
   buzzword: ['P/F ratio', 'bilateral infiltrates', 'low compliance', 'Berlin'],
   source: 'NBME',
   confidence: 3,
-  content_kr: 'ARDS = 비심인성. 폐보호 환기(6 mL/kg) + PEEP. P/F<300.',
+  content_kr: '급성호흡곤란증후군(ARDS) = 비심인성 폐부종(Non-cardiogenic Pulmonary Edema). 폐보호 환기(Lung-protective Ventilation, 6 mL/kg) + 호기말양압(PEEP). P/F비 < 300.',
   content_uz: 'ARDS = nokardiogen. Past hajmli ventilyatsiya (6 mL/kg) + PEEP. P/F<300.',
   content_en: 'ARDS = noncardiogenic. Lung-protective ventilation (6 mL/kg) + PEEP. P/F<300.',
   originalMcq: null,
@@ -526,7 +534,7 @@ const SEED = [{
   buzzword: ['muddy brown casts', 'FENa >2%', 'BUN/Cr <20'],
   source: 'UWorld',
   confidence: 2,
-  content_kr: 'ATN = 세관 괴사. FENa>2%, 갈색 과립 원주. 지지요법.',
+  content_kr: '급성세관괴사(Acute Tubular Necrosis, ATN) = 세관(Tubule) 괴사. 갈색 과립 원주(Muddy Brown Casts), 소변 나트륨 분획 배설(FENa) > 2%. 지지요법.',
   content_uz: 'ATN = kanalcha nekrozi. FENa>2%, jigarrang granular silindrlar. Qo\'llab-quvvatlovchi davo.',
   content_en: 'ATN = tubular necrosis. FENa>2%, muddy-brown casts. Supportive care.',
   originalMcq: null,
@@ -535,23 +543,23 @@ const SEED = [{
 
 /* ── theme ── */
 const C = {
-  bg:    '#0f1623',   // deep navy — distinct from panels
-  panel: '#182031',   // card / surface — clearly lighter than bg
-  panel2:'#1e2a40',   // elevated / active state
-  line:  'rgba(148,163,184,0.16)',  // slate-400 @ 16% — visible border
-  line2: 'rgba(148,163,184,0.30)',  // stronger border
-  text:  '#f1f5f9',   // slate-100 — near white, sharp
-  dim:   '#94a3b8',   // slate-400 — much brighter secondary
-  faint: '#64748b',   // slate-500
-  amber: '#fbbf24',   // amber-400 — vivid
-  teal:  '#22d3ee',   // cyan-400 — vivid
-  red:   '#f87171',   // red-400
-  green: '#4ade80',   // green-400
+  bg:    '#f0f4f8',   // light slate background
+  panel: '#ffffff',   // white card
+  panel2:'#f1f5f9',   // slightly off-white (active tab / hover)
+  line:  'rgba(0,0,0,0.07)',   // subtle border
+  line2: 'rgba(0,0,0,0.13)',   // visible border
+  text:  '#1e293b',   // slate-800 — sharp dark text
+  dim:   '#64748b',   // slate-500
+  faint: '#94a3b8',   // slate-400
+  amber: '#f97316',   // orange-500 — main CTA / action
+  teal:  '#0891b2',   // cyan-600 — system / info accent
+  red:   '#dc2626',   // red-600
+  green: '#059669',   // emerald-600
 };
 const gcss = `
       @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Fraunces:opsz,wght@9..144,400;9..144,600&display=swap');
       .uwn{font-family:'Inter',ui-sans-serif,system-ui,-apple-system,sans-serif;font-size:15px;line-height:1.6;-webkit-font-smoothing:antialiased;}
-      .uwn ::selection{background:#fbbf24;color:#0f1623;}
+      .uwn ::selection{background:#f97316;color:#fff;}
       .serif{font-family:'Fraunces',Georgia,serif;letter-spacing:-.01em;}
       .uwn button,.uwn input,.uwn textarea,.uwn select{font-family:inherit;}
       .uwn button{cursor:pointer;} .uwn textarea{resize:vertical;}
@@ -560,15 +568,18 @@ const gcss = `
       .tap:hover{opacity:.88;}
       .uwn input,.uwn textarea,.uwn select{font-size:14.5px;line-height:1.55;}
       .uwn ::-webkit-scrollbar{width:8px;height:8px;}
-      .uwn ::-webkit-scrollbar-track{background:rgba(255,255,255,.03);}
-      .uwn ::-webkit-scrollbar-thumb{background:rgba(240,246,252,.18);border-radius:8px;}
-      .uwn ::-webkit-scrollbar-thumb:hover{background:rgba(240,246,252,.28);}
+      .uwn ::-webkit-scrollbar-track{background:rgba(0,0,0,.04);}
+      .uwn ::-webkit-scrollbar-thumb{background:rgba(0,0,0,.18);border-radius:8px;}
+      .uwn ::-webkit-scrollbar-thumb:hover{background:rgba(0,0,0,.28);}
       @keyframes fadeUp{from{opacity:0;transform:translateY(5px);}to{opacity:1;transform:none;}}
       .fade{animation:fadeUp .25s ease both;}
+      .uwn{background:transparent;}
+      /* light mode helpers */
+      .panel-card{box-shadow:0 1px 4px rgba(0,0,0,.07);}
     `;
 const field = {
   width: '100%',
-  background: '#0a0f1a',     // 인풋은 bg보다 어둡게 → panel 위에서 depth 확보
+  background: '#f8fafc',    // 흰 패널 위 약간 어두운 인풋 → depth
   color: C.text,
   border: `1.5px solid ${C.line2}`,
   borderRadius: 9,
@@ -582,7 +593,7 @@ const lbl = {
   fontSize: 11.5,
   letterSpacing: '.07em',
   textTransform: 'uppercase',
-  color: '#94a3b8',
+  color: '#64748b',
   marginBottom: 7,
   display: 'block',
   fontWeight: 700,
