@@ -5,984 +5,2939 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>USMLE 오답 인출 노트</title>
   <!--
-    ┌─────────────────────────────────────────────────────────┐
-    │  USMLE 오답 인출 노트  — standalone HTML                │
-    │  단일 파일, 빌드 불필요. 브라우저에서 바로 열기.          │
-    │  데이터: IndexedDB (오프라인 영구 저장)                  │
-    │  GitHub Pages: index.html 로 저장 후 gh-pages 배포 가능 │
-    └─────────────────────────────────────────────────────────┘
+    USMLE 오답 인출 노트 — v2
+    · Supabase 클라우드 동기화 (자동 + 수동 push/pull)
+    · AI 자동완성 (Claude 내장 / OpenAI / Anthropic / Gemini)
+    · localStorage + IndexedDB 마이그레이션
+    · JSON 백업 export/import  ·  Excel export
+    · GitHub Pages: index.html 로 배포
+
+    Supabase 테이블 설정 (최초 1회):
+    ─────────────────────────────────
+    CREATE TABLE usmle_cards (
+      id   text PRIMARY KEY,
+      data text NOT NULL
+    );
+    ALTER TABLE usmle_cards ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY "allow_all" ON usmle_cards
+      FOR ALL USING (true) WITH CHECK (true);
+    ─────────────────────────────────
   -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: #0e0c0a; min-height: 100vh; padding: 16px; }
-    #root { max-width: 860px; margin: 0 auto; }
+    body { background: #0d1117; min-height: 100vh; padding: 20px 16px; }
+    #root { max-width: 880px; margin: 0 auto; }
+    #confirm-overlay {
+      display:none; position:fixed; inset:0; background:rgba(0,0,0,.75);
+      z-index:9999; align-items:center; justify-content:center;
+    }
+    #confirm-overlay.open { display:flex; }
+    #confirm-box {
+      background:#161b22; border:1px solid rgba(240,246,252,0.18);
+      border-radius:14px; padding:28px 24px; max-width:360px; width:90%;
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      box-shadow: 0 16px 48px rgba(0,0,0,.5);
+    }
+    #confirm-msg { color:#e6edf3; font-size:14.5px; line-height:1.65; margin-bottom:20px; }
+    #confirm-btns { display:flex; gap:10px; }
+    #confirm-btns button { flex:1; border-radius:9px; padding:11px; font-size:13.5px;
+      font-weight:700; cursor:pointer; border:none; font-family:inherit; }
+    #confirm-ok  { background:#f0b429; color:#0d1117; }
+    #confirm-can { background:transparent; color:#8b949e; border:1px solid rgba(240,246,252,0.15) !important; }
   </style>
 </head>
 <body>
   <div id="root"></div>
 
-  <script type="text/babel">
-    const { useState, useEffect, useMemo, useRef } = React;
+  <!-- Confirm dialog (vanilla) -->
+  <div id="confirm-overlay">
+    <div id="confirm-box">
+      <div id="confirm-msg"></div>
+      <div id="confirm-btns">
+        <button id="confirm-ok">확인</button>
+        <button id="confirm-can">취소</button>
+      </div>
+    </div>
+  </div>
 
-    /* ============================================================
-       USMLE 오답노트 — v1  (standalone HTML build)
-       인출 루프: Capture → Cue-only → Active recall → Tag → SRS
-       ============================================================ */
+  <!-- ============================================================
+       UTILITY FUNCTIONS  (vanilla JS, accessible globally)
+       ============================================================ -->
+  <script>
+    /* ── Storage keys ── */
+    const STORE_KEY  = 'usmle_cards_v1';
+    const SB_CFG_KEY = 'usmle_supa_cfg';
+    const AI_CFG_KEY = 'usmle_ai_cfg';
 
-    /* ---------- IndexedDB persistence ---------- */
-    const DB_NAME    = "usmle_notebook";
-    const DB_VERSION = 1;
-    const STORE_NAME = "kv";
+    /* ── localStorage helpers ── */
+    function loadStore() {
+      try { const v = localStorage.getItem(STORE_KEY); return v ? JSON.parse(v) : null; }
+      catch { return null; }
+    }
+    function saveStore(cards) {
+      try { localStorage.setItem(STORE_KEY, JSON.stringify(cards)); } catch(e) {}
+    }
 
-    function openDB() {
-      return new Promise((resolve, reject) => {
-        const req = indexedDB.open(DB_NAME, DB_VERSION);
-        req.onupgradeneeded = (e) => {
-          const db = e.target.result;
-          if (!db.objectStoreNames.contains(STORE_NAME))
-            db.createObjectStore(STORE_NAME);
-        };
-        req.onsuccess  = (e) => resolve(e.target.result);
-        req.onerror    = ()  => reject(new Error("DB open failed"));
+    /* ── Migrate from IndexedDB (one-time, v1 users) ── */
+    async function migrateFromIDB() {
+      try {
+        return await Promise.race([
+          new Promise(resolve => {
+            const req = indexedDB.open('usmle_notebook', 1);
+            req.onupgradeneeded = () => resolve(null); // DB가 없었음 → 마이그레이션 불필요
+            req.onblocked       = () => resolve(null);
+            req.onerror         = () => resolve(null);
+            req.onsuccess = e => {
+              const db = e.target.result;
+              if (!db.objectStoreNames.contains('kv')) { resolve(null); return; }
+              try {
+                const r = db.transaction('kv','readonly').objectStore('kv').get('cards');
+                r.onsuccess = () => resolve(r.result ? JSON.parse(r.result) : null);
+                r.onerror   = () => resolve(null);
+              } catch { resolve(null); }
+            };
+          }),
+          new Promise(resolve => setTimeout(() => resolve(null), 800)) // 최대 800ms 대기
+        ]);
+      } catch { return null; }
+    }
+
+    /* ── Supabase ── */
+    function getSbCfg() {
+      try { return JSON.parse(localStorage.getItem(SB_CFG_KEY)); } catch { return null; }
+    }
+    function saveSbCfg(url, key) {
+      localStorage.setItem(SB_CFG_KEY, JSON.stringify({ url: url.replace(/\/$/, ''), key }));
+    }
+    function sbHdrs(extra = {}) {
+      const cfg = getSbCfg();
+      if (!cfg) return {};
+      return {
+        'Content-Type': 'application/json',
+        'apikey': cfg.key,
+        'Authorization': `Bearer ${cfg.key}`,
+        ...extra
+      };
+    }
+    async function sbUpsert(card) {
+      const cfg = getSbCfg(); if (!cfg) return;
+      await fetch(`${cfg.url}/rest/v1/usmle_cards`, {
+        method: 'POST',
+        headers: sbHdrs({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+        body: JSON.stringify({ id: card.id, data: JSON.stringify(card) })
       });
     }
+    async function sbDelete(id) {
+      const cfg = getSbCfg(); if (!cfg) return;
+      await fetch(`${cfg.url}/rest/v1/usmle_cards?id=eq.${encodeURIComponent(id)}`, {
+        method: 'DELETE', headers: sbHdrs({ 'Prefer': 'return=minimal' })
+      });
+    }
+    async function sbLoadAll() {
+      const cfg = getSbCfg(); if (!cfg) return null;
+      const res = await fetch(
+        `${cfg.url}/rest/v1/usmle_cards?select=data&order=id.asc&limit=5000`,
+        { headers: sbHdrs() }
+      );
+      if (!res.ok) throw new Error(`Supabase ${res.status}: ${await res.text()}`);
+      const rows = await res.json();
+      return rows.map(r => JSON.parse(r.data));
+    }
+    async function sbPushAll(cards) {
+      const cfg = getSbCfg(); if (!cfg) return 0;
+      /* 1. delete all */
+      await fetch(`${cfg.url}/rest/v1/usmle_cards?id=not.is.null`, {
+        method: 'DELETE', headers: sbHdrs({ 'Prefer': 'return=minimal' })
+      });
+      if (cards.length === 0) return 0;
+      /* 2. insert all */
+      const rows = cards.map(c => ({ id: c.id, data: JSON.stringify(c) }));
+      const res = await fetch(`${cfg.url}/rest/v1/usmle_cards`, {
+        method: 'POST',
+        headers: sbHdrs({ 'Prefer': 'return=minimal' }),
+        body: JSON.stringify(rows)
+      });
+      if (!res.ok) throw new Error(`Push failed: ${res.status}`);
+      return cards.length;
+    }
+    async function sbTest() {
+      const cfg = getSbCfg(); if (!cfg) throw new Error('미설정');
+      const res = await fetch(
+        `${cfg.url}/rest/v1/usmle_cards?select=id&limit=1`,
+        { headers: sbHdrs() }
+      );
+      if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+      return true;
+    }
+    function cloudSave(card) {
+      if (!getSbCfg()) return;
+      sbUpsert(card).catch(e => console.warn('Cloud save failed:', e.message));
+    }
+    function cloudDel(id) {
+      if (!getSbCfg()) return;
+      sbDelete(id).catch(e => console.warn('Cloud delete failed:', e.message));
+    }
 
-    async function loadStore() {
+    /* ── AI ── */
+    function isClaudeEnv() {
       try {
-        const db = await openDB();
-        return new Promise((resolve) => {
-          const req = db.transaction(STORE_NAME, "readonly")
-                        .objectStore(STORE_NAME).get("cards");
-          req.onsuccess = () => resolve(req.result ? JSON.parse(req.result) : null);
-          req.onerror   = () => resolve(null);
-        });
-      } catch (e) { return null; }
+        return window.location.hostname.includes('claude.ai') ||
+               window.location.hostname.includes('anthropic.com') ||
+               window.parent !== window;
+      } catch { return true; }
     }
-
-    async function saveStore(cards) {
-      try {
-        const db = await openDB();
-        return new Promise((resolve) => {
-          const tx = db.transaction(STORE_NAME, "readwrite");
-          tx.objectStore(STORE_NAME).put(JSON.stringify(cards), "cards");
-          tx.oncomplete = resolve;
-          tx.onerror    = resolve;
-        });
-      } catch (e) {}
-    }
-
-    /* ---------- constants ---------- */
-    const ERROR_TYPES = [
-      { id: "KNOWLEDGE", kr: "지식 부족",  en: "Knowledge", color: "#378ADD" },
-      { id: "TRAP",      kr: "함정/오독",  en: "Trap",       color: "#EF9F27" },
-      { id: "REASONING", kr: "추론 실패",  en: "Reasoning",  color: "#7F77DD" },
-      { id: "RUSH",      kr: "시간 압박",  en: "Rush",       color: "#D85A30" },
-      { id: "GUESS",     kr: "추측",       en: "Guess",      color: "#D4537E" },
-      { id: "CARELESS",  kr: "부주의",     en: "Careless",   color: "#9a9088" },
-    ];
-    const ET = Object.fromEntries(ERROR_TYPES.map((e) => [e.id, e]));
-
-    const SYSTEMS = [
-      "Renal","Cardio","Pulm","GI","Heme/Onc","Endo","Neuro",
-      "MSK","Repro","Immuno","Micro","Pharm","Psych","Biochem","Derm",
-    ];
-
-    /* ---------- SM-2 ---------- */
-    function schedule(srs, pass) {
-      let { interval = 0, ease = 2.5, reps = 0 } = srs || {};
-      const q = pass ? 4 : 2;
-      if (q < 3) { reps = 0; interval = 1; }
-      else {
-        if      (reps === 0) interval = 1;
-        else if (reps === 1) interval = 6;
-        else                 interval = Math.round(interval * ease);
-        reps += 1;
-      }
-      ease = Math.max(1.3, ease + (0.1 - (5 - q) * (0.08 + (5 - q) * 0.02)));
-      const d = new Date();
-      d.setDate(d.getDate() + interval);
-      return { interval, ease: +ease.toFixed(2), reps, dueDate: d.toISOString().slice(0, 10) };
-    }
-
-    const todayStr  = () => new Date().toISOString().slice(0, 10);
-    const isDue     = (c) => !c.srs || !c.srs.dueDate || c.srs.dueDate <= todayStr();
-    const uid       = () => Math.random().toString(36).slice(2, 10);
-
-    function interleave(cards) {
-      const groups = {};
-      cards.forEach((c) => { (groups[c.system] = groups[c.system] || []).push(c); });
-      const keys = Object.keys(groups);
-      const out = []; let added = true;
-      while (added) {
-        added = false;
-        for (const k of keys) { if (groups[k].length) { out.push(groups[k].shift()); added = true; } }
-      }
-      return out;
-    }
-
-    const shuffle = (arr) => {
-      const a = arr.slice();
-      for (let i = a.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [a[i], a[j]] = [a[j], a[i]];
-      }
-      return a;
-    };
-
-    /* ---------- seed cards ---------- */
-    const SEED = [
-      {
-        id: uid(),
-        stem: "유전성 · 저K⁺ + 대사성 알칼리증 + 정상혈압 + 고Ca²⁺뇨 (loop 부위)",
-        myAnswer: "Gitelman syndrome", correct: "Bartter syndrome",
-        errorType: "TRAP", system: "Renal",
-        pathophys: "NKCC2 ↓ (loop of Henle) → furosemide 만성 복용 흉내 → Na/K/Cl 재흡수 ↓",
-        trap: "Gitelman과 혼동 — Gitelman은 저Ca²⁺뇨 + 저Mg²⁺ (DCT, thiazide 흉내)",
-        buzzword: ["NKCC2","loop-diuretic mimic","hypercalciuria"],
-        source: "UWorld", confidence: 4,
-        content_kr: "Bartter = loop(NKCC2) 결함, furosemide 흉내. 고Ca²⁺뇨가 핵심 감별점.",
-        content_uz: "Bartter = Genle qovuzlog'ida (NKCC2) nuqson. Giperkalsiuriya — asosiy farq.",
-        content_en: "Bartter = NKCC2 defect in loop of Henle (loop-diuretic mimic). Hypercalciuria distinguishes from Gitelman.",
-        originalMcq: {
-          stemFull: "A 9-year-old has muscle weakness. Labs: K⁺ 2.8, metabolic alkalosis, normal BP, ↑ urine Ca²⁺. The defect is in which transporter?",
-          options: ["NKCC2 in the thick ascending limb","NCC in the distal convoluted tubule","ENaC in the collecting duct","Na⁺/K⁺-ATPase","Aquaporin-2"],
-          answerIndex: 0,
+    async function callClaudeBuiltin(prompt, maxTokens = 1000) {
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true'
         },
-        srs: null,
-      },
-      {
-        id: uid(),
-        stem: "패혈증 후 급성 저산소혈증 + 양측 침윤 + P/F < 300 + 심부전 아님",
-        myAnswer: "Cardiogenic pulmonary edema", correct: "ARDS (Berlin criteria)",
-        errorType: "REASONING", system: "Pulm",
-        pathophys: "폐포-모세혈관막 손상 → 투과성 ↑ → 비심인성 폐부종 + compliance ↓",
-        trap: "심인성 폐부종과 감별 — ARDS는 PCWP ≤ 18, 정상 심기능",
-        buzzword: ["P/F ratio","bilateral infiltrates","low compliance","Berlin"],
-        source: "NBME", confidence: 3,
-        content_kr: "ARDS = 비심인성. 폐보호 환기(6 mL/kg) + PEEP. P/F<300.",
-        content_uz: "ARDS = nokardiogen. Past hajmli ventilyatsiya (6 mL/kg) + PEEP. P/F<300.",
-        content_en: "ARDS = noncardiogenic. Lung-protective ventilation (6 mL/kg) + PEEP. P/F<300.",
-        originalMcq: null, srs: null,
-      },
-      {
-        id: uid(),
-        stem: "조영제/aminoglycoside 후 AKI + 갈색 과립 원주 + BUN/Cr < 20 + FENa > 2%",
-        myAnswer: "Prerenal azotemia", correct: "Acute tubular necrosis (ATN)",
-        errorType: "KNOWLEDGE", system: "Renal",
-        pathophys: "허혈/신독소 → 근위세관 괴사 → 원주 형성, 농축능 상실",
-        trap: "Prerenal과 감별 — prerenal은 BUN/Cr >20, FENa <1%, ↑UOsm",
-        buzzword: ["muddy brown casts","FENa >2%","BUN/Cr <20"],
-        source: "UWorld", confidence: 2,
-        content_kr: "ATN = 세관 괴사. FENa>2%, 갈색 과립 원주. 지지요법.",
-        content_uz: "ATN = kanalcha nekrozi. FENa>2%, jigarrang granular silindrlar. Qo'llab-quvvatlovchi davo.",
-        content_en: "ATN = tubular necrosis. FENa>2%, muddy-brown casts. Supportive care.",
-        originalMcq: null, srs: null,
-      },
-    ];
-
-    /* ============================================================
-       THEME
-       ============================================================ */
-    const C = {
-      bg: "#14110f", panel: "#1c1814", panel2: "#241e18",
-      line: "rgba(255,255,255,0.08)", line2: "rgba(255,255,255,0.14)",
-      text: "#ece6dd", dim: "#9a9088", faint: "#6f675f",
-      amber: "#e0a050", teal: "#3fae8f", red: "#d8624b", green: "#7bb765",
-    };
-
-    const globalCss = `
-      @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&display=swap');
-      .uwn { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; }
-      .uwn ::selection { background: #e0a050; color: #14110f; }
-      .serif { font-family: 'Fraunces', Georgia, serif; }
-      .uwn button, .uwn input, .uwn textarea, .uwn select { font-family: inherit; }
-      .uwn button { cursor: pointer; }
-      .uwn textarea { resize: vertical; }
-      .tap { transition: transform .12s ease, background .15s ease, border-color .15s ease; }
-      .tap:active { transform: scale(.97); }
-      .uwn ::-webkit-scrollbar { width: 9px; height: 9px; }
-      .uwn ::-webkit-scrollbar-thumb { background: rgba(255,255,255,.13); border-radius: 8px; }
-      @keyframes fadeUp { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
-      .fade { animation: fadeUp .28s ease both; }
-    `;
-
-    const field = {
-      width: "100%", background: C.bg, color: C.text,
-      border: `1px solid ${C.line}`, borderRadius: 8,
-      padding: "9px 11px", fontSize: 14, outline: "none",
-    };
-    const lbl = {
-      fontSize: 11, letterSpacing: ".06em", textTransform: "uppercase",
-      color: C.dim, marginBottom: 5, display: "block", fontWeight: 600,
-    };
-
-    /* ---- shared tiny components ---- */
-    function Badge({ children, color }) {
-      return (
-        <span style={{
-          display: "inline-flex", alignItems: "center", gap: 5,
-          fontSize: 11.5, fontWeight: 600, padding: "3px 9px", borderRadius: 20,
-          color, background: `${color}1f`, border: `1px solid ${color}55`, whiteSpace: "nowrap",
-        }}>{children}</span>
-      );
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: maxTokens,
+          messages: [{ role: 'user', content: prompt }]
+        })
+      });
+      if (!res.ok) throw new Error(`Claude ${res.status}`);
+      const d = await res.json();
+      return d.content?.map(c => c.text || '').join('\n') || '';
     }
-
-    function Row({ k, v, color, strong }) {
-      return (
-        <div style={{ display:"flex", gap:12, padding:"6px 0", borderBottom:`1px solid ${C.line}` }}>
-          <div style={{ width:120, flexShrink:0, fontSize:11.5, color:C.dim, textTransform:"uppercase", letterSpacing:".04em", paddingTop:2 }}>{k}</div>
-          <div style={{ fontSize: strong ? 16 : 14, fontWeight: strong ? 600 : 400, color: color || C.text, lineHeight:1.5 }}>{v}</div>
-        </div>
-      );
+    function getAICfg() {
+      try { return JSON.parse(localStorage.getItem(AI_CFG_KEY)) || {}; }
+      catch { return {}; }
     }
-
-    function DetailRow({ k, v, color, strong }) {
-      if (!v) return null;
-      return (
-        <div style={{ display:"flex", gap:12 }}>
-          <div style={{ width:56, flexShrink:0, fontSize:11, color:C.faint, textTransform:"uppercase", letterSpacing:".04em", paddingTop:2 }}>{k}</div>
-          <div style={{ fontSize: strong ? 15 : 13.5, fontWeight: strong ? 600 : 400, color: color || C.text, lineHeight:1.5 }}>{v}</div>
-        </div>
-      );
+    function saveAICfg(cfg) {
+      localStorage.setItem(AI_CFG_KEY, JSON.stringify(cfg));
     }
-
-    /* ============================================================
-       APP
-       ============================================================ */
-    function App() {
-      const [cards, setCards] = useState(null);
-      const [view, setView]   = useState("recall");
-      const [toast, setToast] = useState("");
-
-      useEffect(() => {
-        (async () => {
-          const stored = await loadStore();
-          if (stored && Array.isArray(stored)) setCards(stored);
-          else { setCards(SEED); saveStore(SEED); }
-        })();
-      }, []);
-
-      const update = (next) => { setCards(next); saveStore(next); };
-      const flash  = (m)    => { setToast(m); setTimeout(() => setToast(""), 1800); };
-      const dueCount = useMemo(() => (cards ? cards.filter(isDue).length : 0), [cards]);
-
-      if (cards === null) {
-        return (
-          <div className="uwn" style={{ background:C.bg, color:C.dim, minHeight:320, display:"flex", alignItems:"center", justifyContent:"center" }}>
-            <style>{globalCss}</style>불러오는 중…
-          </div>
-        );
-      }
-
-      const tabs = [
-        { id:"capture",   kr:"캡처",    en:"Capture" },
-        { id:"recall",    kr:"인출",    en:"Recall",    badge: dueCount },
-        { id:"library",   kr:"목록",    en:"Library" },
-        { id:"dashboard", kr:"대시보드", en:"Dashboard" },
-        { id:"export",    kr:"내보내기", en:"Export" },
-      ];
-
-      return (
-        <div className="uwn" style={{ background:C.bg, color:C.text, minHeight:600, borderRadius:14, overflow:"hidden", border:`1px solid ${C.line}` }}>
-          <style>{globalCss}</style>
-
-          {/* Header */}
-          <div style={{ padding:"16px 20px 0", display:"flex", alignItems:"baseline", justifyContent:"space-between", flexWrap:"wrap", gap:8 }}>
-            <div>
-              <div className="serif" style={{ fontSize:23, fontWeight:600, letterSpacing:"-.01em" }}>
-                오답 인출 노트 <span style={{ color:C.amber }}>·</span>{" "}
-                <span style={{ color:C.dim, fontWeight:400, fontSize:15 }}>Retrieval Notebook</span>
-              </div>
-              <div style={{ fontSize:12, color:C.faint, marginTop:2 }}>Cue-only → active recall → why-wrong tag → SRS</div>
-            </div>
-            <div style={{ fontSize:12, color:C.dim, textAlign:"right" }}>
-              <span style={{ color:C.text, fontWeight:600 }}>{cards.length}</span> cards ·{" "}
-              <span style={{ color: dueCount ? C.amber : C.dim, fontWeight:600 }}>{dueCount}</span> due
-            </div>
-          </div>
-
-          {/* Tabs */}
-          <div style={{ display:"flex", gap:4, padding:"12px 16px 0", flexWrap:"wrap" }}>
-            {tabs.map((t) => {
-              const on = view === t.id;
-              return (
-                <button key={t.id} className="tap" onClick={() => setView(t.id)}
-                  style={{ background: on ? C.panel2 : "transparent", color: on ? C.text : C.dim,
-                    border:`1px solid ${on ? C.line2 : "transparent"}`, borderBottom:"none",
-                    borderRadius:"9px 9px 0 0", padding:"9px 14px", fontSize:13.5, fontWeight: on ? 600 : 500,
-                    display:"flex", alignItems:"center", gap:7 }}>
-                  {t.kr}<span style={{ color:C.faint, fontSize:11 }}>{t.en}</span>
-                  {t.badge > 0 && <span style={{ background:C.amber, color:"#14110f", borderRadius:10, padding:"0 6px", fontSize:11, fontWeight:700 }}>{t.badge}</span>}
-                </button>
-              );
-            })}
-          </div>
-
-          {/* Body */}
-          <div style={{ borderTop:`1px solid ${C.line2}`, padding:20, minHeight:420 }}>
-            {view === "capture"   && <Capture   cards={cards} update={update} flash={flash} />}
-            {view === "recall"    && <Recall    cards={cards} update={update} flash={flash} />}
-            {view === "library"   && <Library   cards={cards} update={update} />}
-            {view === "dashboard" && <Dashboard cards={cards} />}
-            {view === "export"    && <Export    cards={cards} />}
-          </div>
-
-          {toast && (
-            <div className="fade" style={{ position:"sticky", bottom:16, marginLeft:"auto", marginRight:16, width:"fit-content",
-              background:C.teal, color:"#0c1410", fontWeight:600, fontSize:13, padding:"9px 16px", borderRadius:24 }}>
-              {toast}
-            </div>
-          )}
-        </div>
-      );
-    }
-
-    /* ============================================================
-       CAPTURE
-       ============================================================ */
-    const emptyDraft = () => ({
-      stem:"", myAnswer:"", correct:"", errorType:"", system:"Renal",
-      pathophys:"", trap:"", buzzword:"", source:"", confidence:3,
-      content_kr:"", content_uz:"", content_en:"",
-      hasMcq:false, mcqStem:"", mcqOptions:["","","",""], mcqAnswerIndex:0,
-    });
-
-    function Capture({ cards, update, flash }) {
-      const [d, setD] = useState(emptyDraft);
-      const set = (k, v) => setD((p) => ({ ...p, [k]: v }));
-
-      const save = () => {
-        if (!d.stem.trim() || !d.correct.trim() || !d.errorType) { flash("stem · 정답 · 오답유형은 필수"); return; }
-        const card = {
-          id: uid(),
-          stem: d.stem.trim(), myAnswer: d.myAnswer.trim(), correct: d.correct.trim(),
-          errorType: d.errorType, system: d.system,
-          pathophys: d.pathophys.trim(), trap: d.trap.trim(),
-          buzzword: d.buzzword.split(",").map((s) => s.trim()).filter(Boolean),
-          source: d.source.trim(), confidence: d.confidence,
-          content_kr: d.content_kr.trim(), content_uz: d.content_uz.trim(), content_en: d.content_en.trim(),
-          originalMcq: d.hasMcq
-            ? { stemFull: d.mcqStem.trim(), options: d.mcqOptions.map((o) => o.trim()).filter(Boolean), answerIndex: d.mcqAnswerIndex }
-            : null,
-          srs: null,
-        };
-        update([card, ...cards]);
-        setD(emptyDraft());
-        flash("저장됨 · 인출 큐에 추가");
-      };
-
-      const two = { display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 };
-
-      return (
-        <div className="fade" style={{ display:"grid", gap:14, maxWidth:720 }}>
-          <div>
-            <label style={lbl}>Stem · 트리거 패턴 (추상 인출용)*</label>
-            <textarea style={{ ...field, minHeight:60 }} value={d.stem} onChange={(e) => set("stem", e.target.value)}
-              placeholder="예: 패혈증 후 저산소혈증 + 양측 침윤 + P/F<300 + 심부전 아님" />
-          </div>
-
-          <div style={two}>
-            <div><label style={lbl}>내 답 (My answer)</label><input style={field} value={d.myAnswer} onChange={(e) => set("myAnswer", e.target.value)} /></div>
-            <div><label style={lbl}>정답 (Correct)*</label><input style={field} value={d.correct} onChange={(e) => set("correct", e.target.value)} /></div>
-          </div>
-
-          <div>
-            <label style={lbl}>오답 유형 (왜 틀렸나)*</label>
-            <div style={{ display:"flex", gap:7, flexWrap:"wrap" }}>
-              {ERROR_TYPES.map((e) => {
-                const on = d.errorType === e.id;
-                return (
-                  <button key={e.id} className="tap" onClick={() => set("errorType", e.id)}
-                    style={{ background: on ? e.color : `${e.color}1a`, color: on ? "#14110f" : e.color,
-                      border:`1px solid ${e.color}66`, borderRadius:8, padding:"7px 12px", fontSize:13, fontWeight:600 }}>
-                    {e.kr}<span style={{ opacity:.7, fontSize:11, marginLeft:5 }}>{e.en}</span>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          <div style={two}>
-            <div>
-              <label style={lbl}>과목 (System)</label>
-              <select style={field} value={d.system} onChange={(e) => set("system", e.target.value)}>
-                {SYSTEMS.map((s) => <option key={s} value={s}>{s}</option>)}
-              </select>
-            </div>
-            <div>
-              <label style={lbl}>확신도 (Confidence) · {d.confidence}</label>
-              <input type="range" min={1} max={5} value={d.confidence} onChange={(e) => set("confidence", +e.target.value)}
-                style={{ width:"100%", accentColor:C.amber, marginTop:9 }} />
-            </div>
-          </div>
-
-          <div>
-            <label style={lbl}>기전 (Pathophysiology · 1–2줄, ↑↓)</label>
-            <textarea style={{ ...field, minHeight:48 }} value={d.pathophys} onChange={(e) => set("pathophys", e.target.value)} />
-          </div>
-          <div>
-            <label style={lbl}>함정 (Trap · distractor가 속인 이유)</label>
-            <textarea style={{ ...field, minHeight:48 }} value={d.trap} onChange={(e) => set("trap", e.target.value)} />
-          </div>
-
-          <div style={two}>
-            <div><label style={lbl}>Buzzwords (쉼표 구분)</label><input style={field} value={d.buzzword} onChange={(e) => set("buzzword", e.target.value)} placeholder="muddy brown casts, FENa>2%" /></div>
-            <div><label style={lbl}>출처 (Source)</label><input style={field} value={d.source} onChange={(e) => set("source", e.target.value)} placeholder="UWorld Q1234" /></div>
-          </div>
-
-          <div style={{ borderTop:`1px solid ${C.line}`, paddingTop:12 }}>
-            <label style={lbl}>트릴링구얼 해설 (KR / UZ / EN)</label>
-            <div style={{ display:"grid", gap:8 }}>
-              <input style={field} value={d.content_kr} onChange={(e) => set("content_kr", e.target.value)} placeholder="🇰🇷 한국어 해설" />
-              <input style={field} value={d.content_uz} onChange={(e) => set("content_uz", e.target.value)} placeholder="🇺🇿 O'zbekcha izoh" />
-              <input style={field} value={d.content_en} onChange={(e) => set("content_en", e.target.value)} placeholder="🇬🇧 English note" />
-            </div>
-          </div>
-
-          <div style={{ border:`1px solid ${C.line}`, borderRadius:10, padding:14, background:C.panel }}>
-            <label style={{ display:"flex", alignItems:"center", gap:9, cursor:"pointer", fontSize:13.5, fontWeight:600 }}>
-              <input type="checkbox" checked={d.hasMcq} onChange={(e) => set("hasMcq", e.target.checked)}
-                style={{ accentColor:C.amber, width:16, height:16 }} />
-              원문 객관식 저장 (선택) <span style={{ color:C.faint, fontWeight:400, fontSize:12 }}>· 재시도 시 보기 셔플 / 개인 오프라인용</span>
-            </label>
-            {d.hasMcq && (
-              <div className="fade" style={{ marginTop:12, display:"grid", gap:10 }}>
-                <textarea style={{ ...field, minHeight:50 }} value={d.mcqStem} onChange={(e) => set("mcqStem", e.target.value)} placeholder="원문 문제 줄기" />
-                {d.mcqOptions.map((o, i) => (
-                  <div key={i} style={{ display:"flex", gap:8, alignItems:"center" }}>
-                    <button className="tap" onClick={() => set("mcqAnswerIndex", i)}
-                      style={{ width:26, height:26, borderRadius:"50%", flexShrink:0,
-                        border:`1px solid ${d.mcqAnswerIndex === i ? C.green : C.line2}`,
-                        background: d.mcqAnswerIndex === i ? C.green : "transparent", color:"#14110f", fontWeight:700, fontSize:12 }}>
-                      {String.fromCharCode(65 + i)}
-                    </button>
-                    <input style={field} value={o}
-                      onChange={(e) => { const m = d.mcqOptions.slice(); m[i] = e.target.value; set("mcqOptions", m); }}
-                      placeholder={`보기 ${String.fromCharCode(65 + i)}`} />
-                    {d.mcqOptions.length > 2 && (
-                      <button className="tap" onClick={() => { const m = d.mcqOptions.filter((_,j)=>j!==i); set("mcqOptions",m); if(d.mcqAnswerIndex>=m.length) set("mcqAnswerIndex",0); }}
-                        style={{ background:"transparent", border:`1px solid ${C.line}`, color:C.dim, borderRadius:6, padding:"4px 9px", fontSize:12 }}>✕</button>
-                    )}
-                  </div>
-                ))}
-                <button className="tap" onClick={() => set("mcqOptions", [...d.mcqOptions, ""])}
-                  style={{ background:"transparent", border:`1px dashed ${C.line2}`, color:C.dim, borderRadius:8, padding:"7px", fontSize:13, width:"fit-content" }}>+ 보기 추가</button>
-                <div style={{ fontSize:11.5, color:C.faint }}>● 인출 화면에서 보기는 자동 셔플돼 위치 암기를 차단합니다.</div>
-              </div>
-            )}
-          </div>
-
-          <div style={{ display:"flex", gap:10 }}>
-            <button className="tap" onClick={save} style={{ background:C.amber, color:"#14110f", border:"none", borderRadius:9, padding:"11px 22px", fontSize:14.5, fontWeight:700 }}>저장 (Save)</button>
-            <button className="tap" onClick={() => setD(emptyDraft())} style={{ background:"transparent", color:C.dim, border:`1px solid ${C.line}`, borderRadius:9, padding:"11px 18px", fontSize:14 }}>초기화</button>
-          </div>
-        </div>
-      );
-    }
-
-    /* ============================================================
-       RECALL
-       ============================================================ */
-    function Recall({ cards, update, flash }) {
-      const queue   = useMemo(() => interleave(cards.filter(isDue)), [cards]);
-      const [i, setI]             = useState(0);
-      const [revealed, setRevealed] = useState(false);
-      const [retry, setRetry]     = useState(false);
-      const [picked, setPicked]   = useState(null);
-
-      const card = queue[i];
-
-      const shuffled = useMemo(() => {
-        if (!card || !card.originalMcq) return null;
-        return shuffle(card.originalMcq.options.map((text, idx) => ({ text, correct: idx === card.originalMcq.answerIndex })));
-      }, [card, retry]);
-
-      useEffect(() => { setRevealed(false); setRetry(false); setPicked(null); }, [i]);
-
-      const grade = (pass) => {
-        const next = cards.map((c) => c.id === card.id ? { ...c, srs: schedule(c.srs, pass) } : c);
-        update(next);
-        flash(pass ? "✅ 다음 복습 연장" : "❌ 곧 다시 출제");
-        if (i + 1 >= queue.length) setI(0); else setI(i + 1);
-      };
-
-      if (queue.length === 0) {
-        return (
-          <div className="fade" style={{ textAlign:"center", padding:"70px 20px", color:C.dim }}>
-            <div className="serif" style={{ fontSize:22, color:C.text, marginBottom:8 }}>오늘 복습할 카드가 없습니다 🎉</div>
-            <div style={{ fontSize:14 }}>모든 due 카드를 인출했어요. 새 오답을 캡처하거나 내일 다시 오세요.</div>
-          </div>
-        );
-      }
-
-      const et = ET[card.errorType];
-
-      return (
-        <div className="fade">
-          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14 }}>
-            <div style={{ display:"flex", gap:8, alignItems:"center" }}>
-              <Badge color={C.teal}>{card.system}</Badge>
-              <Badge color={et.color}>{et.kr} · {et.en}</Badge>
-            </div>
-            <div style={{ fontSize:12, color:C.dim }}>{i + 1} / {queue.length}</div>
-          </div>
-
-          <div style={{ background:C.panel2, border:`1px solid ${C.line2}`, borderRadius:12, padding:"22px 22px" }}>
-            <div style={{ fontSize:11, color:C.faint, marginBottom:8, letterSpacing:".05em", textTransform:"uppercase" }}>인출하기 · recall this</div>
-            {!retry ? (
-              <div className="serif" style={{ fontSize:19, lineHeight:1.5 }}>{card.stem}</div>
-            ) : (
-              <div className="fade">
-                <div style={{ fontSize:15, lineHeight:1.55, marginBottom:14 }}>{card.originalMcq.stemFull}</div>
-                <div style={{ display:"grid", gap:8 }}>
-                  {shuffled.map((o, idx) => {
-                    const sel = picked === idx;
-                    let bd = C.line2, bg = C.bg, fg = C.text;
-                    if (revealed && o.correct)          { bd = C.green; bg = `${C.green}1f`; }
-                    else if (revealed && sel && !o.correct) { bd = C.red;   bg = `${C.red}1f`; }
-                    else if (sel)                       { bd = C.amber; }
-                    return (
-                      <button key={idx} className="tap" disabled={revealed} onClick={() => setPicked(idx)}
-                        style={{ textAlign:"left", display:"flex", gap:10, alignItems:"center", background:bg, color:fg, border:`1px solid ${bd}`, borderRadius:9, padding:"10px 12px", fontSize:14 }}>
-                        <span style={{ fontWeight:700, color:C.dim }}>{String.fromCharCode(65+idx)}</span>{o.text}
-                        {revealed && o.correct && <span style={{ marginLeft:"auto", color:C.green, fontWeight:700 }}>✓</span>}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-            {card.originalMcq && (
-              <button className="tap" onClick={() => { setRetry(!retry); setRevealed(false); setPicked(null); }}
-                style={{ marginTop:14, background:"transparent", border:`1px solid ${C.line2}`, color:C.dim, borderRadius:8, padding:"6px 12px", fontSize:12.5 }}>
-                {retry ? "↩ 추상 트리거로" : "↻ 원문 재시도 (보기 셔플)"}
-              </button>
-            )}
-          </div>
-
-          {!revealed ? (
-            <button className="tap" onClick={() => setRevealed(true)}
-              style={{ marginTop:16, width:"100%", background:C.amber, color:"#14110f", border:"none", borderRadius:10, padding:"13px", fontSize:15, fontWeight:700 }}>
-              정답 · 해설 공개 (탭)
-            </button>
-          ) : (
-            <div className="fade" style={{ marginTop:16, background:C.panel, border:`1px solid ${C.line}`, borderRadius:12, padding:18 }}>
-              <Row k="정답 · Correct" v={card.correct} strong color={C.green} />
-              {card.myAnswer && <Row k="내 답 · Mine"    v={card.myAnswer} color={C.red} />}
-              {card.pathophys && <Row k="기전 · Pathophys" v={card.pathophys} />}
-              {card.trap      && <Row k="함정 · Trap"      v={card.trap}      color={C.amber} />}
-              {card.buzzword?.length > 0 && (
-                <div style={{ display:"flex", gap:6, flexWrap:"wrap", margin:"10px 0 4px" }}>
-                  {card.buzzword.map((b,k) => <Badge key={k} color={C.teal}>{b}</Badge>)}
-                </div>
-              )}
-              {(card.content_kr || card.content_uz || card.content_en) && (
-                <div style={{ marginTop:12, borderTop:`1px solid ${C.line}`, paddingTop:10, display:"grid", gap:6, fontSize:13.5 }}>
-                  {card.content_kr && <div><span style={{ color:C.faint }}>🇰🇷 </span>{card.content_kr}</div>}
-                  {card.content_uz && <div><span style={{ color:C.faint }}>🇺🇿 </span>{card.content_uz}</div>}
-                  {card.content_en && <div><span style={{ color:C.faint }}>🇬🇧 </span>{card.content_en}</div>}
-                </div>
-              )}
-              <div style={{ display:"flex", gap:10, marginTop:18 }}>
-                <button className="tap" onClick={() => grade(false)}
-                  style={{ flex:1, background:`${C.red}22`, color:C.red, border:`1px solid ${C.red}66`, borderRadius:9, padding:"12px", fontSize:14.5, fontWeight:700 }}>❌ 틀림 · 곧 다시</button>
-                <button className="tap" onClick={() => grade(true)}
-                  style={{ flex:1, background:`${C.green}22`, color:C.green, border:`1px solid ${C.green}66`, borderRadius:9, padding:"12px", fontSize:14.5, fontWeight:700 }}>✅ 맞음 · 연장</button>
-              </div>
-              <div style={{ fontSize:11.5, color:C.faint, marginTop:8, textAlign:"center" }}>
-                출처 {card.source || "—"} · 현재 간격 {card.srs ? `${card.srs.interval}d` : "신규"}
-              </div>
-            </div>
-          )}
-        </div>
-      );
-    }
-
-    /* ============================================================
-       LIBRARY
-       ============================================================ */
-    function Library({ cards, update }) {
-      const [search,    setSearch]    = useState("");
-      const [sysFilter, setSysFilter] = useState("");
-      const [etFilter,  setEtFilter]  = useState("");
-      const [dueOnly,   setDueOnly]   = useState(false);
-      const [sort,      setSort]      = useState("default");
-      const [expanded,  setExpanded]  = useState(null);
-      const [editing,   setEditing]   = useState(null);
-      const [editDraft, setEditDraft] = useState(null);
-
-      const setED = (k, v) => setEditDraft((p) => ({ ...p, [k]: v }));
-
-      const filtered = useMemo(() => {
-        let list = cards;
-        if (search.trim()) {
-          const q = search.toLowerCase();
-          list = list.filter((c) =>
-            c.stem.toLowerCase().includes(q) ||
-            c.correct.toLowerCase().includes(q) ||
-            (c.trap || "").toLowerCase().includes(q) ||
-            (c.buzzword || []).some((b) => b.toLowerCase().includes(q))
-          );
+    async function callAI(prompt, maxTokens = 1000) {
+      if (isClaudeEnv()) {
+        for (let i = 0; i < 3; i++) {
+          try { return await callClaudeBuiltin(prompt, maxTokens); }
+          catch(e) {
+            if ((e.message.includes('529') || e.message.includes('overloaded')) && i < 2) {
+              await new Promise(r => setTimeout(r, (i + 1) * 1500));
+              continue;
+            }
+            break;
+          }
         }
-        if (sysFilter) list = list.filter((c) => c.system === sysFilter);
-        if (etFilter)  list = list.filter((c) => c.errorType === etFilter);
-        if (dueOnly)   list = list.filter(isDue);
-        if (sort === "dueDate")    list = list.slice().sort((a,b) => ((a.srs?.dueDate||"0") < (b.srs?.dueDate||"0") ? -1 : 1));
-        if (sort === "system")     list = list.slice().sort((a,b) => a.system.localeCompare(b.system));
-        if (sort === "confidence") list = list.slice().sort((a,b) => (b.confidence||0) - (a.confidence||0));
-        return list;
-      }, [cards, search, sysFilter, etFilter, dueOnly, sort]);
-
-      const del = (id) => {
-        update(cards.filter((c) => c.id !== id));
-        if (expanded === id) setExpanded(null);
-        if (editing  === id) { setEditing(null); setEditDraft(null); }
-      };
-
-      const startEdit = (card) => {
-        setEditDraft({
-          stem: card.stem, myAnswer: card.myAnswer||"", correct: card.correct,
-          errorType: card.errorType, system: card.system,
-          pathophys: card.pathophys||"", trap: card.trap||"",
-          buzzword: (card.buzzword||[]).join(", "), source: card.source||"",
-          confidence: card.confidence||3,
-          content_kr: card.content_kr||"", content_uz: card.content_uz||"", content_en: card.content_en||"",
-          hasMcq: !!card.originalMcq,
-          mcqStem: card.originalMcq?.stemFull||"",
-          mcqOptions: card.originalMcq?.options?.length ? [...card.originalMcq.options] : ["","","",""],
-          mcqAnswerIndex: card.originalMcq?.answerIndex||0,
+      }
+      const cfg = getAICfg();
+      if (cfg.anthropicKey) {
+        const res = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': cfg.anthropicKey,
+            'anthropic-version': '2023-06-01',
+            'anthropic-dangerous-direct-browser-access': 'true'
+          },
+          body: JSON.stringify({
+            model: cfg.modelAnthropic || 'claude-sonnet-4-6',
+            max_tokens: maxTokens,
+            messages: [{ role: 'user', content: prompt }]
+          })
         });
-        setEditing(card.id);
-        setExpanded(null);
-      };
+        if (!res.ok) throw new Error(`Anthropic ${res.status}`);
+        const d = await res.json();
+        return d.content?.map(c => c.text || '').join('\n') || '';
+      }
+      if (cfg.geminiKey) {
+        const model = cfg.modelGemini || 'gemini-2.0-flash';
+        const res = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${cfg.geminiKey}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: prompt }] }],
+              generationConfig: { maxOutputTokens: maxTokens }
+            })
+          }
+        );
+        if (!res.ok) throw new Error(`Gemini ${res.status}`);
+        const d = await res.json();
+        return d.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      }
+      if (cfg.openaiKey) {
+        const res = await fetch('https://api.openai.com/v1/responses', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${cfg.openaiKey}` },
+          body: JSON.stringify({
+            model: cfg.modelOpenAI || 'gpt-4o-mini',
+            input: prompt,
+            max_output_tokens: maxTokens
+          })
+        });
+        if (!res.ok) throw new Error(`OpenAI ${res.status}`);
+        const d = await res.json();
+        if (d.output_text) return d.output_text;
+        return (d.output || []).flatMap(i => i.content || []).map(c => c.text || '').join('\n');
+      }
+      throw new Error('AI API 미설정. 설정 탭에서 API 키를 입력해주세요.');
+    }
+    async function aiEnrichCard(stem, correct, myAnswer) {
+      const prompt = `You are a USMLE Step 1/Step 2 CK expert. Given this wrong-answer card:
+Correct answer: ${correct}
+My wrong answer: ${myAnswer || '(not specified)'}
+Stem/trigger: ${stem}
 
-      const saveEdit = (id) => {
-        const d = editDraft;
-        if (!d.stem.trim() || !d.correct.trim() || !d.errorType) return;
-        update(cards.map((c) => c.id !== id ? c : {
-          ...c,
-          stem: d.stem.trim(), myAnswer: d.myAnswer.trim(), correct: d.correct.trim(),
-          errorType: d.errorType, system: d.system,
-          pathophys: d.pathophys.trim(), trap: d.trap.trim(),
-          buzzword: d.buzzword.split(",").map((s)=>s.trim()).filter(Boolean),
-          source: d.source.trim(), confidence: d.confidence,
-          content_kr: d.content_kr.trim(), content_uz: d.content_uz.trim(), content_en: d.content_en.trim(),
-          originalMcq: d.hasMcq
-            ? { stemFull: d.mcqStem.trim(), options: d.mcqOptions.map((o)=>o.trim()).filter(Boolean), answerIndex: d.mcqAnswerIndex }
-            : null,
-        }));
+Generate concise USMLE-style content. Respond ONLY with valid JSON (no markdown, no extra text):
+{
+  "pathophys": "1-2 line mechanism using up/down arrows (↑↓)",
+  "trap": "why a student would pick the wrong answer instead of correct one",
+  "content_kr": "1-2 sentence Korean explanation (핵심만, 고득점 포인트)",
+  "content_uz": "1-2 sentence Uzbek explanation (asosiy nuqta)",
+  "content_en": "1-2 sentence English high-yield note",
+  "buzzword": "comma-separated 2-4 USMLE buzzwords"
+}`;
+      const raw = await callAI(prompt, 900);
+      const clean = raw.replace(/```json\s*|\s*```/g, '').trim();
+      const s = clean.indexOf('{'), e = clean.lastIndexOf('}');
+      if (s === -1 || e === -1) throw new Error('AI 응답 파싱 실패: JSON을 찾을 수 없음');
+      return JSON.parse(clean.slice(s, e + 1));
+    }
+
+    /* ── Export helpers ── */
+    function exportJSON(cards) {
+      const json = JSON.stringify({ version: 2, exported: new Date().toISOString(), count: cards.length, cards }, null, 2);
+      _download(new Blob([json], { type: 'application/json' }), 'usmle_backup.json');
+    }
+    function exportExcel(cards) {
+      const rows = cards.map(c => ({
+        'Stem': c.stem, 'My Answer': c.myAnswer, 'Correct': c.correct,
+        'Error Type': c.errorType, 'System': c.system,
+        'Pathophys': c.pathophys, 'Trap': c.trap,
+        'Buzzword': (c.buzzword || []).join(', '),
+        'Source': c.source, 'Confidence': c.confidence,
+        'KR': c.content_kr, 'UZ': c.content_uz, 'EN': c.content_en,
+        'SRS Interval': c.srs?.interval || 0, 'Due Date': c.srs?.dueDate || '',
+      }));
+      const ws = XLSX.utils.json_to_sheet(rows);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'USMLE Cards');
+      XLSX.writeFile(wb, 'usmle_cards.xlsx');
+    }
+    function _download(blob, name) {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = name; a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    /* ── Confirm dialog ── */
+    function showConfirm(msg, onOk, onCancel) {
+      document.getElementById('confirm-msg').innerHTML = msg;
+      const ov = document.getElementById('confirm-overlay');
+      const ok = document.getElementById('confirm-ok');
+      const can = document.getElementById('confirm-can');
+      ov.classList.add('open');
+      const close = () => ov.classList.remove('open');
+      ok.onclick  = () => { close(); onOk && onOk(); };
+      can.onclick = () => { close(); onCancel && onCancel(); };
+    }
+
+    /* ── Toast ── */
+    function showGlobalToast(msg) {
+      let el = document.getElementById('g-toast');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'g-toast';
+        Object.assign(el.style, {
+          position:'fixed', bottom:'24px', right:'24px', zIndex:'9998',
+          background:'#3fae8f', color:'#0c1410', fontWeight:'700', fontSize:'13px',
+          padding:'10px 18px', borderRadius:'24px',
+          fontFamily:'ui-sans-serif,system-ui,sans-serif',
+          boxShadow:'0 4px 20px rgba(0,0,0,.4)',
+          transition:'opacity .3s', opacity:'0', pointerEvents:'none'
+        });
+        document.body.appendChild(el);
+      }
+      el.textContent = msg;
+      el.style.opacity = '1';
+      clearTimeout(el._t);
+      el._t = setTimeout(() => { el.style.opacity = '0'; }, 2200);
+    }
+  </script>
+
+  <!-- ============================================================
+       REACT COMPONENTS  (Babel JSX)
+       ============================================================ -->
+  <script>
+const {
+  useState,
+  useEffect,
+  useMemo,
+  useRef,
+  useCallback
+} = React;
+
+/* ── constants ── */
+const ERROR_TYPES = [{
+  id: 'KNOWLEDGE',
+  kr: '지식 부족',
+  en: 'Knowledge',
+  color: '#378ADD'
+}, {
+  id: 'TRAP',
+  kr: '함정/오독',
+  en: 'Trap',
+  color: '#EF9F27'
+}, {
+  id: 'REASONING',
+  kr: '추론 실패',
+  en: 'Reasoning',
+  color: '#7F77DD'
+}, {
+  id: 'RUSH',
+  kr: '시간 압박',
+  en: 'Rush',
+  color: '#D85A30'
+}, {
+  id: 'GUESS',
+  kr: '추측',
+  en: 'Guess',
+  color: '#D4537E'
+}, {
+  id: 'CARELESS',
+  kr: '부주의',
+  en: 'Careless',
+  color: '#9a9088'
+}];
+const ET = Object.fromEntries(ERROR_TYPES.map(e => [e.id, e]));
+const SYSTEMS = ['Renal', 'Cardio', 'Pulm', 'GI', 'Heme/Onc', 'Endo', 'Neuro', 'MSK', 'Repro', 'Immuno', 'Micro', 'Pharm', 'Psych', 'Biochem', 'Derm'];
+
+/* ── SM-2 ── */
+function schedule(srs, pass) {
+  let {
+    interval = 0,
+    ease = 2.5,
+    reps = 0
+  } = srs || {};
+  const q = pass ? 4 : 2;
+  if (q < 3) {
+    reps = 0;
+    interval = 1;
+  } else {
+    if (reps === 0) interval = 1;else if (reps === 1) interval = 6;else interval = Math.round(interval * ease);
+    reps++;
+  }
+  ease = Math.max(1.3, ease + (0.1 - (5 - q) * (0.08 + (5 - q) * 0.02)));
+  const d = new Date();
+  d.setDate(d.getDate() + interval);
+  return {
+    interval,
+    ease: +ease.toFixed(2),
+    reps,
+    dueDate: d.toISOString().slice(0, 10)
+  };
+}
+const todayStr = () => new Date().toISOString().slice(0, 10);
+const isDue = c => !c.srs || !c.srs.dueDate || c.srs.dueDate <= todayStr();
+const uid = () => Math.random().toString(36).slice(2, 10);
+function interleave(cards) {
+  const g = {};
+  cards.forEach(c => {
+    (g[c.system] = g[c.system] || []).push(c);
+  });
+  const keys = Object.keys(g),
+    out = [];
+  let added = true;
+  while (added) {
+    added = false;
+    for (const k of keys) if (g[k].length) {
+      out.push(g[k].shift());
+      added = true;
+    }
+  }
+  return out;
+}
+const shuffle = arr => {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+};
+
+/* ── seed cards ── */
+const SEED = [{
+  id: uid(),
+  stem: '유전성 · 저K⁺ + 대사성 알칼리증 + 정상혈압 + 고Ca²⁺뇨 (loop 부위)',
+  myAnswer: 'Gitelman syndrome',
+  correct: 'Bartter syndrome',
+  errorType: 'TRAP',
+  system: 'Renal',
+  pathophys: 'NKCC2 ↓ (loop of Henle) → furosemide 흉내 → Na/K/Cl 재흡수 ↓',
+  trap: 'Gitelman과 혼동 — Gitelman은 저Ca²⁺뇨 + 저Mg²⁺ (DCT, thiazide 흉내)',
+  buzzword: ['NKCC2', 'loop-diuretic mimic', 'hypercalciuria'],
+  source: 'UWorld',
+  confidence: 4,
+  content_kr: 'Bartter = loop(NKCC2) 결함. 고Ca²⁺뇨가 핵심 감별점.',
+  content_uz: 'Bartter = NKCC2 nuqson. Giperkalsiuriya — asosiy farq.',
+  content_en: 'Bartter = NKCC2 defect (loop-diuretic mimic). Hypercalciuria distinguishes from Gitelman.',
+  originalMcq: {
+    stemFull: 'A 9-year-old has muscle weakness. Labs: K⁺ 2.8, metabolic alkalosis, normal BP, ↑ urine Ca²⁺. The defect is in which transporter?',
+    options: ['NKCC2 in the thick ascending limb', 'NCC in the distal convoluted tubule', 'ENaC in the collecting duct', 'Na⁺/K⁺-ATPase', 'Aquaporin-2'],
+    answerIndex: 0
+  },
+  srs: null
+}, {
+  id: uid(),
+  stem: '패혈증 후 급성 저산소혈증 + 양측 침윤 + P/F < 300 + 심부전 아님',
+  myAnswer: 'Cardiogenic pulmonary edema',
+  correct: 'ARDS (Berlin criteria)',
+  errorType: 'REASONING',
+  system: 'Pulm',
+  pathophys: '폐포-모세혈관막 손상 → 투과성 ↑ → 비심인성 폐부종 + compliance ↓',
+  trap: '심인성 폐부종과 감별 — ARDS는 PCWP ≤ 18, 정상 심기능',
+  buzzword: ['P/F ratio', 'bilateral infiltrates', 'low compliance', 'Berlin'],
+  source: 'NBME',
+  confidence: 3,
+  content_kr: 'ARDS = 비심인성. 폐보호 환기(6 mL/kg) + PEEP. P/F<300.',
+  content_uz: 'ARDS = nokardiogen. Past hajmli ventilyatsiya (6 mL/kg) + PEEP. P/F<300.',
+  content_en: 'ARDS = noncardiogenic. Lung-protective ventilation (6 mL/kg) + PEEP. P/F<300.',
+  originalMcq: null,
+  srs: null
+}, {
+  id: uid(),
+  stem: '조영제/aminoglycoside 후 AKI + 갈색 과립 원주 + BUN/Cr < 20 + FENa > 2%',
+  myAnswer: 'Prerenal azotemia',
+  correct: 'Acute tubular necrosis (ATN)',
+  errorType: 'KNOWLEDGE',
+  system: 'Renal',
+  pathophys: '허혈/신독소 → 근위세관 괴사 → 원주 형성, 농축능 상실',
+  trap: 'Prerenal과 감별 — prerenal은 BUN/Cr >20, FENa <1%, ↑UOsm',
+  buzzword: ['muddy brown casts', 'FENa >2%', 'BUN/Cr <20'],
+  source: 'UWorld',
+  confidence: 2,
+  content_kr: 'ATN = 세관 괴사. FENa>2%, 갈색 과립 원주. 지지요법.',
+  content_uz: 'ATN = kanalcha nekrozi. FENa>2%, jigarrang granular silindrlar. Qo\'llab-quvvatlovchi davo.',
+  content_en: 'ATN = tubular necrosis. FENa>2%, muddy-brown casts. Supportive care.',
+  originalMcq: null,
+  srs: null
+}];
+
+/* ── theme ── */
+const C = {
+  bg:    '#0d1117',   // GitHub dark bg — proven long-read palette
+  panel: '#161b22',   // surface
+  panel2:'#1c2128',   // elevated surface
+  line:  'rgba(240,246,252,0.10)',
+  line2: 'rgba(240,246,252,0.18)',
+  text:  '#e6edf3',   // high contrast (7:1 ratio)
+  dim:   '#8b949e',   // secondary text
+  faint: '#6e7681',   // tertiary text
+  amber: '#f0b429',   // brighter amber — visible on dark
+  teal:  '#39c5cf',   // clinical teal
+  red:   '#f85149',   // GitHub red
+  green: '#3fb950',   // GitHub green
+};
+const gcss = `
+      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Fraunces:opsz,wght@9..144,400;9..144,600&display=swap');
+      .uwn{font-family:'Inter',ui-sans-serif,system-ui,-apple-system,sans-serif;font-size:15px;line-height:1.6;-webkit-font-smoothing:antialiased;}
+      .uwn ::selection{background:#f0b429;color:#0d1117;}
+      .serif{font-family:'Fraunces',Georgia,serif;letter-spacing:-.01em;}
+      .uwn button,.uwn input,.uwn textarea,.uwn select{font-family:inherit;}
+      .uwn button{cursor:pointer;} .uwn textarea{resize:vertical;}
+      .tap{transition:transform .12s ease,background .15s ease,border-color .15s ease,opacity .15s;}
+      .tap:active{transform:scale(.97);}
+      .tap:hover{opacity:.88;}
+      .uwn input,.uwn textarea,.uwn select{font-size:14.5px;line-height:1.55;}
+      .uwn ::-webkit-scrollbar{width:8px;height:8px;}
+      .uwn ::-webkit-scrollbar-track{background:rgba(255,255,255,.03);}
+      .uwn ::-webkit-scrollbar-thumb{background:rgba(240,246,252,.18);border-radius:8px;}
+      .uwn ::-webkit-scrollbar-thumb:hover{background:rgba(240,246,252,.28);}
+      @keyframes fadeUp{from{opacity:0;transform:translateY(5px);}to{opacity:1;transform:none;}}
+      .fade{animation:fadeUp .25s ease both;}
+    `;
+const field = {
+  width: '100%',
+  background: C.panel,
+  color: C.text,
+  border: `1px solid ${C.line2}`,
+  borderRadius: 8,
+  padding: '10px 13px',
+  fontSize: 14.5,
+  outline: 'none',
+  lineHeight: 1.55,
+};
+const lbl = {
+  fontSize: 11,
+  letterSpacing: '.06em',
+  textTransform: 'uppercase',
+  color: C.dim,
+  marginBottom: 5,
+  display: 'block',
+  fontWeight: 600
+};
+
+/* ── micro-components ── */
+function Badge({
+  children,
+  color
+}) {
+  return /*#__PURE__*/React.createElement("span", {
+    style: {
+      display: 'inline-flex',
+      alignItems: 'center',
+      gap: 5,
+      fontSize: 11.5,
+      fontWeight: 600,
+      padding: '3px 9px',
+      borderRadius: 20,
+      color,
+      background: `${color}1f`,
+      border: `1px solid ${color}55`,
+      whiteSpace: 'nowrap'
+    }
+  }, children);
+}
+function Row({
+  k,
+  v,
+  color,
+  strong
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 12,
+      padding: '6px 0',
+      borderBottom: `1px solid ${C.line}`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 120,
+      flexShrink: 0,
+      fontSize: 11.5,
+      color: C.dim,
+      textTransform: 'uppercase',
+      letterSpacing: '.04em',
+      paddingTop: 2
+    }
+  }, k), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: strong ? 16 : 14,
+      fontWeight: strong ? 600 : 400,
+      color: color || C.text,
+      lineHeight: 1.5
+    }
+  }, v));
+}
+function DetailRow({
+  k,
+  v,
+  color,
+  strong
+}) {
+  if (!v) return null;
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 12
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 56,
+      flexShrink: 0,
+      fontSize: 11,
+      color: C.faint,
+      textTransform: 'uppercase',
+      letterSpacing: '.04em',
+      paddingTop: 2
+    }
+  }, k), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: strong ? 15 : 13.5,
+      fontWeight: strong ? 600 : 400,
+      color: color || C.text,
+      lineHeight: 1.5
+    }
+  }, v));
+}
+
+/* ============================================================
+   APP
+   ============================================================ */
+function App() {
+  const [cards, setCards] = useState(null);
+  const [view, setView] = useState('recall');
+  const [toast, setToast] = useState('');
+  useEffect(() => {
+    (async () => {
+      try {
+        /* 1. try localStorage first (synchronous, always fast) */
+        let data = loadStore();
+        /* 2. fallback: try migrate from IndexedDB with timeout */
+        if (!data) data = await migrateFromIDB();
+        if (data && Array.isArray(data) && data.length > 0) {
+          setCards(data);
+          if (!loadStore()) saveStore(data);
+        } else {
+          setCards(SEED);
+          saveStore(SEED);
+        }
+      } catch(e) {
+        /* 어떤 오류가 발생해도 SEED로 fallback — 절대 멈추지 않음 */
+        console.error('App init error:', e);
+        setCards(SEED);
+        saveStore(SEED);
+      }
+    })();
+  }, []);
+  const update = useCallback((next, deletedId = null) => {
+    setCards(next);
+    saveStore(next);
+    if (deletedId) cloudDel(deletedId);
+  }, []);
+  const flash = m => {
+    setToast(m);
+    setTimeout(() => setToast(''), 1800);
+  };
+  const dueCount = useMemo(() => cards ? cards.filter(isDue).length : 0, [cards]);
+  if (!cards) return /*#__PURE__*/React.createElement("div", {
+    className: "uwn",
+    style: {
+      background: C.bg,
+      color: C.dim,
+      minHeight: 320,
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center'
+    }
+  }, /*#__PURE__*/React.createElement("style", null, gcss), "\uBD88\uB7EC\uC624\uB294 \uC911\u2026");
+  const tabs = [{
+    id: 'capture',
+    kr: '캡처',
+    en: 'Capture'
+  }, {
+    id: 'recall',
+    kr: '인출',
+    en: 'Recall',
+    badge: dueCount
+  }, {
+    id: 'library',
+    kr: '목록',
+    en: 'Library'
+  }, {
+    id: 'dashboard',
+    kr: '대시보드',
+    en: 'Dashboard'
+  }, {
+    id: 'export',
+    kr: '내보내기',
+    en: 'Export'
+  }, {
+    id: 'settings',
+    kr: '설정',
+    en: 'Settings'
+  }];
+  return /*#__PURE__*/React.createElement("div", {
+    className: "uwn",
+    style: {
+      background: C.bg,
+      color: C.text,
+      minHeight: 600,
+      borderRadius: 14,
+      overflow: 'hidden',
+      border: `1px solid ${C.line}`
+    }
+  }, /*#__PURE__*/React.createElement("style", null, gcss), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '16px 20px 0',
+      display: 'flex',
+      alignItems: 'baseline',
+      justifyContent: 'space-between',
+      flexWrap: 'wrap',
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "serif",
+    style: {
+      fontSize: 23,
+      fontWeight: 600,
+      letterSpacing: '-.01em'
+    }
+  }, "\uC624\uB2F5 \uC778\uCD9C \uB178\uD2B8 ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.amber
+    }
+  }, "\xB7"), ' ', /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.dim,
+      fontWeight: 400,
+      fontSize: 15
+    }
+  }, "Retrieval Notebook")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.faint,
+      marginTop: 2
+    }
+  }, "Cue-only \u2192 active recall \u2192 why-wrong tag \u2192 SRS", getSbCfg() && /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.teal,
+      marginLeft: 10
+    }
+  }, "\u2601 Supabase \uC5F0\uACB0\uB428"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.dim,
+      textAlign: 'right'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.text,
+      fontWeight: 600
+    }
+  }, cards.length), " cards \xB7", ' ', /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: dueCount ? C.amber : C.dim,
+      fontWeight: 600
+    }
+  }, dueCount), " due")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 4,
+      padding: '12px 16px 0',
+      flexWrap: 'wrap'
+    }
+  }, tabs.map(t => {
+    const on = view === t.id;
+    return /*#__PURE__*/React.createElement("button", {
+      key: t.id,
+      className: "tap",
+      onClick: () => setView(t.id),
+      style: {
+        background: on ? C.panel2 : 'transparent',
+        color: on ? C.text : C.dim,
+        border: `1px solid ${on ? C.line2 : 'transparent'}`,
+        borderBottom: 'none',
+        borderRadius: '9px 9px 0 0',
+        padding: '9px 14px',
+        fontSize: 13.5,
+        fontWeight: on ? 600 : 500,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 7
+      }
+    }, t.kr, /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.faint,
+        fontSize: 11
+      }
+    }, t.en), t.badge > 0 && /*#__PURE__*/React.createElement("span", {
+      style: {
+        background: C.amber,
+        color: '#14110f',
+        borderRadius: 10,
+        padding: '0 6px',
+        fontSize: 11,
+        fontWeight: 700
+      }
+    }, t.badge));
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      borderTop: `1px solid ${C.line2}`,
+      padding: 20,
+      minHeight: 420
+    }
+  }, view === 'capture' && /*#__PURE__*/React.createElement(Capture, {
+    cards: cards,
+    update: update,
+    flash: flash
+  }), view === 'recall' && /*#__PURE__*/React.createElement(Recall, {
+    cards: cards,
+    update: update,
+    flash: flash
+  }), view === 'library' && /*#__PURE__*/React.createElement(Library, {
+    cards: cards,
+    update: update,
+    flash: flash
+  }), view === 'dashboard' && /*#__PURE__*/React.createElement(Dashboard, {
+    cards: cards
+  }), view === 'export' && /*#__PURE__*/React.createElement(Export, {
+    cards: cards,
+    update: update,
+    flash: flash
+  }), view === 'settings' && /*#__PURE__*/React.createElement(Settings, {
+    cards: cards,
+    update: update,
+    flash: flash
+  })), toast && /*#__PURE__*/React.createElement("div", {
+    className: "fade",
+    style: {
+      position: 'sticky',
+      bottom: 16,
+      marginLeft: 'auto',
+      marginRight: 16,
+      width: 'fit-content',
+      background: C.teal,
+      color: '#0c1410',
+      fontWeight: 600,
+      fontSize: 13,
+      padding: '9px 16px',
+      borderRadius: 24
+    }
+  }, toast));
+}
+
+/* ============================================================
+   CAPTURE  (+ AI 자동완성)
+   ============================================================ */
+const emptyDraft = () => ({
+  stem: '',
+  myAnswer: '',
+  correct: '',
+  errorType: '',
+  system: 'Renal',
+  pathophys: '',
+  trap: '',
+  buzzword: '',
+  source: '',
+  confidence: 3,
+  content_kr: '',
+  content_uz: '',
+  content_en: '',
+  hasMcq: false,
+  mcqStem: '',
+  mcqOptions: ['', '', '', ''],
+  mcqAnswerIndex: 0
+});
+function Capture({
+  cards,
+  update,
+  flash
+}) {
+  const [d, setD] = useState(emptyDraft);
+  const [aiLoading, setAiLoading] = useState(false);
+  const set = (k, v) => setD(p => ({
+    ...p,
+    [k]: v
+  }));
+  const aiAutofill = async () => {
+    if (!d.stem.trim() || !d.correct.trim()) {
+      flash('stem과 정답을 먼저 입력해주세요');
+      return;
+    }
+    setAiLoading(true);
+    try {
+      const r = await aiEnrichCard(d.stem, d.correct, d.myAnswer);
+      setD(p => ({
+        ...p,
+        pathophys: r.pathophys || p.pathophys,
+        trap: r.trap || p.trap,
+        content_kr: r.content_kr || p.content_kr,
+        content_uz: r.content_uz || p.content_uz,
+        content_en: r.content_en || p.content_en,
+        buzzword: r.buzzword || p.buzzword
+      }));
+      flash('✨ AI 자동완성 완료');
+    } catch (e) {
+      flash('AI 오류: ' + e.message);
+    } finally {
+      setAiLoading(false);
+    }
+  };
+  const save = () => {
+    if (!d.stem.trim() || !d.correct.trim() || !d.errorType) {
+      flash('stem · 정답 · 오답유형은 필수');
+      return;
+    }
+    const card = {
+      id: uid(),
+      stem: d.stem.trim(),
+      myAnswer: d.myAnswer.trim(),
+      correct: d.correct.trim(),
+      errorType: d.errorType,
+      system: d.system,
+      pathophys: d.pathophys.trim(),
+      trap: d.trap.trim(),
+      buzzword: d.buzzword.split(',').map(s => s.trim()).filter(Boolean),
+      source: d.source.trim(),
+      confidence: d.confidence,
+      content_kr: d.content_kr.trim(),
+      content_uz: d.content_uz.trim(),
+      content_en: d.content_en.trim(),
+      originalMcq: d.hasMcq ? {
+        stemFull: d.mcqStem.trim(),
+        options: d.mcqOptions.map(o => o.trim()).filter(Boolean),
+        answerIndex: d.mcqAnswerIndex
+      } : null,
+      srs: null
+    };
+    update([card, ...cards]);
+    cloudSave(card);
+    setD(emptyDraft());
+    flash('저장됨 · 인출 큐에 추가');
+  };
+  const two = {
+    display: 'grid',
+    gridTemplateColumns: '1fr 1fr',
+    gap: 12
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "fade",
+    style: {
+      display: 'grid',
+      gap: 14,
+      maxWidth: 720
+    }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+    style: lbl
+  }, "Stem \xB7 \uD2B8\uB9AC\uAC70 \uD328\uD134 (\uCD94\uC0C1 \uC778\uCD9C\uC6A9)*"), /*#__PURE__*/React.createElement("textarea", {
+    style: {
+      ...field,
+      minHeight: 60
+    },
+    value: d.stem,
+    onChange: e => set('stem', e.target.value),
+    placeholder: "\uC608: \uD328\uD608\uC99D \uD6C4 \uC800\uC0B0\uC18C\uD608\uC99D + \uC591\uCE21 \uCE68\uC724 + P/F<300 + \uC2EC\uBD80\uC804 \uC544\uB2D8"
+  })), /*#__PURE__*/React.createElement("div", {
+    style: two
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+    style: lbl
+  }, "\uB0B4 \uB2F5 (My answer)"), /*#__PURE__*/React.createElement("input", {
+    style: field,
+    value: d.myAnswer,
+    onChange: e => set('myAnswer', e.target.value)
+  })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+    style: lbl
+  }, "\uC815\uB2F5 (Correct)*"), /*#__PURE__*/React.createElement("input", {
+    style: field,
+    value: d.correct,
+    onChange: e => set('correct', e.target.value)
+  }))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+    style: lbl
+  }, "\uC624\uB2F5 \uC720\uD615 (\uC65C \uD2C0\uB838\uB098)*"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 7,
+      flexWrap: 'wrap'
+    }
+  }, ERROR_TYPES.map(e => {
+    const on = d.errorType === e.id;
+    return /*#__PURE__*/React.createElement("button", {
+      key: e.id,
+      className: "tap",
+      onClick: () => set('errorType', e.id),
+      style: {
+        background: on ? e.color : `${e.color}1a`,
+        color: on ? '#14110f' : e.color,
+        border: `1px solid ${e.color}66`,
+        borderRadius: 8,
+        padding: '7px 12px',
+        fontSize: 13,
+        fontWeight: 600
+      }
+    }, e.kr, /*#__PURE__*/React.createElement("span", {
+      style: {
+        opacity: .7,
+        fontSize: 11,
+        marginLeft: 5
+      }
+    }, e.en));
+  }))), /*#__PURE__*/React.createElement("div", {
+    style: two
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+    style: lbl
+  }, "\uACFC\uBAA9 (System)"), /*#__PURE__*/React.createElement("select", {
+    style: field,
+    value: d.system,
+    onChange: e => set('system', e.target.value)
+  }, SYSTEMS.map(s => /*#__PURE__*/React.createElement("option", {
+    key: s,
+    value: s
+  }, s)))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+    style: lbl
+  }, "\uD655\uC2E0\uB3C4 \xB7 ", d.confidence), /*#__PURE__*/React.createElement("input", {
+    type: "range",
+    min: 1,
+    max: 5,
+    value: d.confidence,
+    onChange: e => set('confidence', +e.target.value),
+    style: {
+      width: '100%',
+      accentColor: C.amber,
+      marginTop: 9
+    }
+  }))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      marginBottom: 5
+    }
+  }, /*#__PURE__*/React.createElement("label", {
+    style: {
+      ...lbl,
+      marginBottom: 0
+    }
+  }, "\uAE30\uC804 / \uD568\uC815 / \uD2B8\uB9B4\uB9C1\uAD6C\uC5BC \uD574\uC124"), /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: aiAutofill,
+    disabled: aiLoading,
+    style: {
+      background: aiLoading ? `${C.amber}44` : C.amber,
+      color: '#14110f',
+      border: 'none',
+      borderRadius: 8,
+      padding: '5px 13px',
+      fontSize: 12.5,
+      fontWeight: 700
+    }
+  }, aiLoading ? '✨ 생성 중…' : '✨ AI 자동완성')), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'grid',
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement("textarea", {
+    style: {
+      ...field,
+      minHeight: 44
+    },
+    value: d.pathophys,
+    onChange: e => set('pathophys', e.target.value),
+    placeholder: "\uAE30\uC804 (Pathophys \xB7 1\u20132\uC904, \u2191\u2193)"
+  }), /*#__PURE__*/React.createElement("textarea", {
+    style: {
+      ...field,
+      minHeight: 44
+    },
+    value: d.trap,
+    onChange: e => set('trap', e.target.value),
+    placeholder: "\uD568\uC815 (Trap \xB7 distractor\uAC00 \uC18D\uC778 \uC774\uC720)"
+  }))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      borderTop: `1px solid ${C.line}`,
+      paddingTop: 12
+    }
+  }, /*#__PURE__*/React.createElement("label", {
+    style: lbl
+  }, "\uD2B8\uB9B4\uB9C1\uAD6C\uC5BC \uD574\uC124 (KR / UZ / EN)"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'grid',
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    style: field,
+    value: d.content_kr,
+    onChange: e => set('content_kr', e.target.value),
+    placeholder: "\uD83C\uDDF0\uD83C\uDDF7 \uD55C\uAD6D\uC5B4 \uD574\uC124"
+  }), /*#__PURE__*/React.createElement("input", {
+    style: field,
+    value: d.content_uz,
+    onChange: e => set('content_uz', e.target.value),
+    placeholder: "\uD83C\uDDFA\uD83C\uDDFF O'zbekcha izoh"
+  }), /*#__PURE__*/React.createElement("input", {
+    style: field,
+    value: d.content_en,
+    onChange: e => set('content_en', e.target.value),
+    placeholder: "\uD83C\uDDEC\uD83C\uDDE7 English note"
+  }))), /*#__PURE__*/React.createElement("div", {
+    style: two
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+    style: lbl
+  }, "Buzzwords (\uC27C\uD45C \uAD6C\uBD84)"), /*#__PURE__*/React.createElement("input", {
+    style: field,
+    value: d.buzzword,
+    onChange: e => set('buzzword', e.target.value),
+    placeholder: "muddy brown casts, FENa>2%"
+  })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+    style: lbl
+  }, "\uCD9C\uCC98 (Source)"), /*#__PURE__*/React.createElement("input", {
+    style: field,
+    value: d.source,
+    onChange: e => set('source', e.target.value),
+    placeholder: "UWorld Q1234"
+  }))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      border: `1px solid ${C.line}`,
+      borderRadius: 10,
+      padding: 14,
+      background: C.panel
+    }
+  }, /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 9,
+      cursor: 'pointer',
+      fontSize: 13.5,
+      fontWeight: 600
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: d.hasMcq,
+    onChange: e => set('hasMcq', e.target.checked),
+    style: {
+      accentColor: C.amber,
+      width: 16,
+      height: 16
+    }
+  }), "\uC6D0\uBB38 \uAC1D\uAD00\uC2DD \uC800\uC7A5 (\uC120\uD0DD) ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.faint,
+      fontWeight: 400,
+      fontSize: 12
+    }
+  }, "\xB7 \uC7AC\uC2DC\uB3C4 \uC2DC \uBCF4\uAE30 \uC154\uD50C")), d.hasMcq && /*#__PURE__*/React.createElement("div", {
+    className: "fade",
+    style: {
+      marginTop: 12,
+      display: 'grid',
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement("textarea", {
+    style: {
+      ...field,
+      minHeight: 50
+    },
+    value: d.mcqStem,
+    onChange: e => set('mcqStem', e.target.value),
+    placeholder: "\uC6D0\uBB38 \uBB38\uC81C \uC904\uAE30"
+  }), d.mcqOptions.map((o, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      display: 'flex',
+      gap: 8,
+      alignItems: 'center'
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: () => set('mcqAnswerIndex', i),
+    style: {
+      width: 26,
+      height: 26,
+      borderRadius: '50%',
+      flexShrink: 0,
+      border: `1px solid ${d.mcqAnswerIndex === i ? C.green : C.line2}`,
+      background: d.mcqAnswerIndex === i ? C.green : 'transparent',
+      color: '#14110f',
+      fontWeight: 700,
+      fontSize: 12
+    }
+  }, String.fromCharCode(65 + i)), /*#__PURE__*/React.createElement("input", {
+    style: field,
+    value: o,
+    onChange: e => {
+      const m = d.mcqOptions.slice();
+      m[i] = e.target.value;
+      set('mcqOptions', m);
+    },
+    placeholder: `보기 ${String.fromCharCode(65 + i)}`
+  }), d.mcqOptions.length > 2 && /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: () => {
+      const m = d.mcqOptions.filter((_, j) => j !== i);
+      set('mcqOptions', m);
+      if (d.mcqAnswerIndex >= m.length) set('mcqAnswerIndex', 0);
+    },
+    style: {
+      background: 'transparent',
+      border: `1px solid ${C.line}`,
+      color: C.dim,
+      borderRadius: 6,
+      padding: '4px 9px',
+      fontSize: 12
+    }
+  }, "\u2715"))), /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: () => set('mcqOptions', [...d.mcqOptions, '']),
+    style: {
+      background: 'transparent',
+      border: `1px dashed ${C.line2}`,
+      color: C.dim,
+      borderRadius: 8,
+      padding: '7px',
+      fontSize: 13,
+      width: 'fit-content'
+    }
+  }, "+ \uBCF4\uAE30 \uCD94\uAC00"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: save,
+    style: {
+      background: C.amber,
+      color: '#14110f',
+      border: 'none',
+      borderRadius: 9,
+      padding: '11px 22px',
+      fontSize: 14.5,
+      fontWeight: 700
+    }
+  }, "\uC800\uC7A5 (Save)"), /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: () => setD(emptyDraft()),
+    style: {
+      background: 'transparent',
+      color: C.dim,
+      border: `1px solid ${C.line}`,
+      borderRadius: 9,
+      padding: '11px 18px',
+      fontSize: 14
+    }
+  }, "\uCD08\uAE30\uD654")));
+}
+
+/* ============================================================
+   RECALL
+   ============================================================ */
+function Recall({
+  cards,
+  update,
+  flash
+}) {
+  const queue = useMemo(() => interleave(cards.filter(isDue)), [cards]);
+  const [i, setI] = useState(0);
+  const [revealed, setRevealed] = useState(false);
+  const [retry, setRetry] = useState(false);
+  const [picked, setPicked] = useState(null);
+  const card = queue[i];
+  const shuffled = useMemo(() => {
+    if (!card || !card.originalMcq) return null;
+    return shuffle(card.originalMcq.options.map((text, idx) => ({
+      text,
+      correct: idx === card.originalMcq.answerIndex
+    })));
+  }, [card, retry]);
+  useEffect(() => {
+    setRevealed(false);
+    setRetry(false);
+    setPicked(null);
+  }, [i]);
+  const grade = pass => {
+    const updated = {
+      ...card,
+      srs: schedule(card.srs, pass)
+    };
+    const next = cards.map(c => c.id === card.id ? updated : c);
+    update(next);
+    cloudSave(updated);
+    flash(pass ? '✅ 다음 복습 연장' : '❌ 곧 다시 출제');
+    if (i + 1 >= queue.length) setI(0);else setI(i + 1);
+  };
+  if (queue.length === 0) return /*#__PURE__*/React.createElement("div", {
+    className: "fade",
+    style: {
+      textAlign: 'center',
+      padding: '70px 20px',
+      color: C.dim
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "serif",
+    style: {
+      fontSize: 22,
+      color: C.text,
+      marginBottom: 8
+    }
+  }, "\uC624\uB298 \uBCF5\uC2B5\uD560 \uCE74\uB4DC\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4 \uD83C\uDF89"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 14
+    }
+  }, "\uBAA8\uB4E0 due \uCE74\uB4DC\uB97C \uC778\uCD9C\uD588\uC5B4\uC694. \uC0C8 \uC624\uB2F5\uC744 \uCEA1\uCC98\uD558\uAC70\uB098 \uB0B4\uC77C \uB2E4\uC2DC \uC624\uC138\uC694."));
+  const et = ET[card.errorType];
+  return /*#__PURE__*/React.createElement("div", {
+    className: "fade"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      marginBottom: 14
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      alignItems: 'center'
+    }
+  }, /*#__PURE__*/React.createElement(Badge, {
+    color: C.teal
+  }, card.system), /*#__PURE__*/React.createElement(Badge, {
+    color: et.color
+  }, et.kr, " \xB7 ", et.en)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.dim
+    }
+  }, i + 1, " / ", queue.length)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: C.panel2,
+      border: `1px solid ${C.line2}`,
+      borderRadius: 12,
+      padding: '22px 22px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: C.faint,
+      marginBottom: 8,
+      letterSpacing: '.05em',
+      textTransform: 'uppercase'
+    }
+  }, "\uC778\uCD9C\uD558\uAE30 \xB7 recall this"), !retry ? /*#__PURE__*/React.createElement("div", {
+    className: "serif",
+    style: {
+      fontSize: 19,
+      lineHeight: 1.5
+    }
+  }, card.stem) : /*#__PURE__*/React.createElement("div", {
+    className: "fade"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 15,
+      lineHeight: 1.55,
+      marginBottom: 14
+    }
+  }, card.originalMcq.stemFull), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'grid',
+      gap: 8
+    }
+  }, shuffled.map((o, idx) => {
+    const sel = picked === idx;
+    let bd = C.line2,
+      bg = C.bg,
+      fg = C.text;
+    if (revealed && o.correct) {
+      bd = C.green;
+      bg = `${C.green}1f`;
+    } else if (revealed && sel && !o.correct) {
+      bd = C.red;
+      bg = `${C.red}1f`;
+    } else if (sel) {
+      bd = C.amber;
+    }
+    return /*#__PURE__*/React.createElement("button", {
+      key: idx,
+      className: "tap",
+      disabled: revealed,
+      onClick: () => setPicked(idx),
+      style: {
+        textAlign: 'left',
+        display: 'flex',
+        gap: 10,
+        alignItems: 'center',
+        background: bg,
+        color: fg,
+        border: `1px solid ${bd}`,
+        borderRadius: 9,
+        padding: '10px 12px',
+        fontSize: 14
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontWeight: 700,
+        color: C.dim
+      }
+    }, String.fromCharCode(65 + idx)), o.text, revealed && o.correct && /*#__PURE__*/React.createElement("span", {
+      style: {
+        marginLeft: 'auto',
+        color: C.green,
+        fontWeight: 700
+      }
+    }, "\u2713"));
+  }))), card.originalMcq && /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: () => {
+      setRetry(!retry);
+      setRevealed(false);
+      setPicked(null);
+    },
+    style: {
+      marginTop: 14,
+      background: 'transparent',
+      border: `1px solid ${C.line2}`,
+      color: C.dim,
+      borderRadius: 8,
+      padding: '6px 12px',
+      fontSize: 12.5
+    }
+  }, retry ? '↩ 추상 트리거로' : '↻ 원문 재시도 (보기 셔플)')), !revealed ? /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: () => setRevealed(true),
+    style: {
+      marginTop: 16,
+      width: '100%',
+      background: C.amber,
+      color: '#14110f',
+      border: 'none',
+      borderRadius: 10,
+      padding: '13px',
+      fontSize: 15,
+      fontWeight: 700
+    }
+  }, "\uC815\uB2F5 \xB7 \uD574\uC124 \uACF5\uAC1C (\uD0ED)") : /*#__PURE__*/React.createElement("div", {
+    className: "fade",
+    style: {
+      marginTop: 16,
+      background: C.panel,
+      border: `1px solid ${C.line}`,
+      borderRadius: 12,
+      padding: 18
+    }
+  }, /*#__PURE__*/React.createElement(Row, {
+    k: "\uC815\uB2F5 \xB7 Correct",
+    v: card.correct,
+    strong: true,
+    color: C.green
+  }), card.myAnswer && /*#__PURE__*/React.createElement(Row, {
+    k: "\uB0B4 \uB2F5 \xB7 Mine",
+    v: card.myAnswer,
+    color: C.red
+  }), card.pathophys && /*#__PURE__*/React.createElement(Row, {
+    k: "\uAE30\uC804 \xB7 Pathophys",
+    v: card.pathophys
+  }), card.trap && /*#__PURE__*/React.createElement(Row, {
+    k: "\uD568\uC815 \xB7 Trap",
+    v: card.trap,
+    color: C.amber
+  }), card.buzzword?.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 6,
+      flexWrap: 'wrap',
+      margin: '10px 0 4px'
+    }
+  }, card.buzzword.map((b, k) => /*#__PURE__*/React.createElement(Badge, {
+    key: k,
+    color: C.teal
+  }, b))), (card.content_kr || card.content_uz || card.content_en) && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 12,
+      borderTop: `1px solid ${C.line}`,
+      paddingTop: 10,
+      display: 'grid',
+      gap: 6,
+      fontSize: 13.5
+    }
+  }, card.content_kr && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.faint
+    }
+  }, "\uD83C\uDDF0\uD83C\uDDF7 "), card.content_kr), card.content_uz && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.faint
+    }
+  }, "\uD83C\uDDFA\uD83C\uDDFF "), card.content_uz), card.content_en && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.faint
+    }
+  }, "\uD83C\uDDEC\uD83C\uDDE7 "), card.content_en)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 10,
+      marginTop: 18
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: () => grade(false),
+    style: {
+      flex: 1,
+      background: `${C.red}22`,
+      color: C.red,
+      border: `1px solid ${C.red}66`,
+      borderRadius: 9,
+      padding: '12px',
+      fontSize: 14.5,
+      fontWeight: 700
+    }
+  }, "\u274C \uD2C0\uB9BC \xB7 \uACE7 \uB2E4\uC2DC"), /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: () => grade(true),
+    style: {
+      flex: 1,
+      background: `${C.green}22`,
+      color: C.green,
+      border: `1px solid ${C.green}66`,
+      borderRadius: 9,
+      padding: '12px',
+      fontSize: 14.5,
+      fontWeight: 700
+    }
+  }, "\u2705 \uB9DE\uC74C \xB7 \uC5F0\uC7A5")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11.5,
+      color: C.faint,
+      marginTop: 8,
+      textAlign: 'center'
+    }
+  }, "\uCD9C\uCC98 ", card.source || '—', " \xB7 \uD604\uC7AC \uAC04\uACA9 ", card.srs ? `${card.srs.interval}d` : '신규')));
+}
+
+/* ============================================================
+   LIBRARY  (목록, 검색, 필터, 상세, 수정 + AI)
+   ============================================================ */
+function Library({
+  cards,
+  update,
+  flash
+}) {
+  const [search, setSearch] = useState('');
+  const [sysFilter, setSysFilter] = useState('');
+  const [etFilter, setEtFilter] = useState('');
+  const [dueOnly, setDueOnly] = useState(false);
+  const [sort, setSort] = useState('default');
+  const [expanded, setExpanded] = useState(null);
+  const [editing, setEditing] = useState(null);
+  const [editDraft, setEditDraft] = useState(null);
+  const [aiLoading, setAiLoading] = useState(false);
+  const setED = (k, v) => setEditDraft(p => ({
+    ...p,
+    [k]: v
+  }));
+  const filtered = useMemo(() => {
+    let list = cards;
+    if (search.trim()) {
+      const q = search.toLowerCase();
+      list = list.filter(c => c.stem.toLowerCase().includes(q) || c.correct.toLowerCase().includes(q) || (c.trap || '').toLowerCase().includes(q) || (c.buzzword || []).some(b => b.toLowerCase().includes(q)));
+    }
+    if (sysFilter) list = list.filter(c => c.system === sysFilter);
+    if (etFilter) list = list.filter(c => c.errorType === etFilter);
+    if (dueOnly) list = list.filter(isDue);
+    if (sort === 'dueDate') list = list.slice().sort((a, b) => (a.srs?.dueDate || '0') < (b.srs?.dueDate || '0') ? -1 : 1);
+    if (sort === 'system') list = list.slice().sort((a, b) => a.system.localeCompare(b.system));
+    if (sort === 'confidence') list = list.slice().sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+    return list;
+  }, [cards, search, sysFilter, etFilter, dueOnly, sort]);
+  const del = id => {
+    showConfirm('이 카드를 삭제할까요?', () => {
+      update(cards.filter(c => c.id !== id), id);
+      if (expanded === id) setExpanded(null);
+      if (editing === id) {
         setEditing(null);
         setEditDraft(null);
-      };
-
-      const toggle = (id) => { if (editing===id) return; setExpanded((p) => p===id ? null : id); };
-
-      return (
-        <div className="fade" style={{ display:"grid", gap:14 }}>
-          {/* Search + filters */}
-          <div style={{ display:"grid", gap:9 }}>
-            <input style={{ ...field, fontSize:14 }} value={search} onChange={(e)=>setSearch(e.target.value)}
-              placeholder="🔍  stem · 정답 · buzzword 검색…" />
-            <div style={{ display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
-              <select style={{ ...field, width:"auto", fontSize:13, padding:"7px 11px" }}
-                value={sysFilter} onChange={(e)=>setSysFilter(e.target.value)}>
-                <option value="">모든 과목</option>
-                {SYSTEMS.map((s)=><option key={s} value={s}>{s}</option>)}
-              </select>
-              <select style={{ ...field, width:"auto", fontSize:13, padding:"7px 11px" }}
-                value={sort} onChange={(e)=>setSort(e.target.value)}>
-                <option value="default">최신순</option>
-                <option value="dueDate">복습일순</option>
-                <option value="system">과목순</option>
-                <option value="confidence">확신도 ↓</option>
-              </select>
-              <button className="tap" onClick={()=>setDueOnly((p)=>!p)}
-                style={{ background: dueOnly ? `${C.amber}22` : "transparent", color: dueOnly ? C.amber : C.dim,
-                  border:`1px solid ${dueOnly ? C.amber : C.line2}`, borderRadius:8, padding:"7px 13px", fontSize:13, fontWeight:600 }}>
-                DUE만
-              </button>
-              <div style={{ marginLeft:"auto", fontSize:12, color:C.dim }}>
-                <span style={{ color:C.text, fontWeight:600 }}>{filtered.length}</span> / {cards.length}
-              </div>
-            </div>
-            {/* Error type filter pills */}
-            <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
-              <button className="tap" onClick={()=>setEtFilter("")}
-                style={{ background:!etFilter?`${C.dim}22`:"transparent", color:!etFilter?C.text:C.faint,
-                  border:`1px solid ${!etFilter?C.dim:C.line}`, borderRadius:20, padding:"4px 11px", fontSize:12, fontWeight:600 }}>전체</button>
-              {ERROR_TYPES.map((e)=>(
-                <button key={e.id} className="tap" onClick={()=>setEtFilter((p)=>p===e.id?"":e.id)}
-                  style={{ background:etFilter===e.id?`${e.color}22`:"transparent", color:etFilter===e.id?e.color:C.faint,
-                    border:`1px solid ${etFilter===e.id?e.color:C.line}`, borderRadius:20, padding:"4px 11px", fontSize:12, fontWeight:600 }}>
-                  {e.kr}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Card list */}
-          {filtered.length === 0
-            ? <div style={{ textAlign:"center", padding:"48px 20px", color:C.faint, fontSize:14 }}>카드 없음</div>
-            : <div style={{ display:"grid", gap:6 }}>
-                {filtered.map((c) => {
-                  const et   = ET[c.errorType];
-                  const due  = isDue(c);
-                  const isExp = expanded === c.id;
-                  const isEd  = editing  === c.id;
-                  return (
-                    <div key={c.id} style={{ border:`1px solid ${isEd?`${C.amber}55`:isExp?C.line2:C.line}`, borderRadius:10, overflow:"hidden", background:C.panel }}>
-                      {/* Row */}
-                      <div onClick={()=>!isEd&&toggle(c.id)}
-                        style={{ display:"flex", gap:10, alignItems:"center", padding:"11px 13px", cursor:isEd?"default":"pointer" }}>
-                        <div style={{ width:4, alignSelf:"stretch", borderRadius:4, flexShrink:0, background:et.color }} />
-                        <div style={{ flex:1, minWidth:0 }}>
-                          <div style={{ fontSize:13.5, lineHeight:1.45, overflow:"hidden", textOverflow:"ellipsis", whiteSpace: isExp?"normal":"nowrap" }}>{c.stem}</div>
-                          <div style={{ fontSize:12, color:C.dim, marginTop:4, display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
-                            <span style={{ color:C.teal, fontWeight:600 }}>{c.system}</span>
-                            <span style={{ color:et.color }}>{et.kr}</span>
-                            <span style={{ color:C.green, fontWeight:500 }}>→ {c.correct}</span>
-                            {c.confidence >= 4 && <span style={{ color:C.red, fontSize:11 }}>확신 {c.confidence} ⚠</span>}
-                          </div>
-                        </div>
-                        <div style={{ display:"flex", gap:6, flexShrink:0, alignItems:"center" }}>
-                          {due && <span style={{ background:`${C.amber}22`, color:C.amber, border:`1px solid ${C.amber}55`, borderRadius:12, padding:"2px 8px", fontSize:11, fontWeight:700 }}>DUE</span>}
-                          {c.srs?.interval && !due && <span style={{ fontSize:11, color:C.faint }}>{c.srs.interval}d</span>}
-                          <button className="tap" onClick={(e)=>{e.stopPropagation();startEdit(c);}}
-                            style={{ background:"transparent", border:`1px solid ${C.line2}`, color:C.dim, borderRadius:6, padding:"4px 9px", fontSize:12 }}>수정</button>
-                          <button className="tap" onClick={(e)=>{e.stopPropagation();del(c.id);}}
-                            style={{ background:"transparent", border:`1px solid ${C.line}`, color:C.faint, borderRadius:6, padding:"4px 9px", fontSize:12 }}>✕</button>
-                        </div>
-                      </div>
-
-                      {/* Detail */}
-                      {isExp && (
-                        <div className="fade" style={{ borderTop:`1px solid ${C.line}`, padding:"14px 16px", background:C.bg, display:"grid", gap:6 }}>
-                          <DetailRow k="내 답"  v={c.myAnswer}   color={C.red} />
-                          <DetailRow k="정답"   v={c.correct}    color={C.green} strong />
-                          <DetailRow k="기전"   v={c.pathophys} />
-                          <DetailRow k="함정"   v={c.trap}       color={C.amber} />
-                          {c.buzzword?.length > 0 && (
-                            <div style={{ display:"flex", gap:5, flexWrap:"wrap", marginTop:2 }}>
-                              {c.buzzword.map((b,i)=><Badge key={i} color={C.teal}>{b}</Badge>)}
-                            </div>
-                          )}
-                          {(c.content_kr||c.content_uz||c.content_en) && (
-                            <div style={{ borderTop:`1px solid ${C.line}`, paddingTop:8, marginTop:4, display:"grid", gap:5, fontSize:13 }}>
-                              {c.content_kr && <div><span style={{ color:C.faint }}>🇰🇷 </span>{c.content_kr}</div>}
-                              {c.content_uz && <div><span style={{ color:C.faint }}>🇺🇿 </span>{c.content_uz}</div>}
-                              {c.content_en && <div><span style={{ color:C.faint }}>🇬🇧 </span>{c.content_en}</div>}
-                            </div>
-                          )}
-                          <div style={{ fontSize:11.5, color:C.faint, marginTop:4, display:"flex", gap:16, flexWrap:"wrap" }}>
-                            <span>출처: {c.source||"—"}</span>
-                            <span>확신도: {c.confidence}/5</span>
-                            <span>SRS: {c.srs ? `${c.srs.interval}d / ease ${c.srs.ease} / reps ${c.srs.reps}` : "신규"}</span>
-                            {c.originalMcq && <span>MCQ: {c.originalMcq.options.length}지</span>}
-                          </div>
-                        </div>
-                      )}
-
-                      {/* Edit form */}
-                      {isEd && editDraft && (
-                        <div className="fade" style={{ borderTop:`1px solid ${C.amber}44`, padding:"16px", background:C.bg, display:"grid", gap:11 }}>
-                          <div style={{ fontSize:12, color:C.amber, fontWeight:700 }}>수정 모드 · Edit</div>
-                          <div><label style={lbl}>Stem*</label>
-                            <textarea style={{ ...field, minHeight:52 }} value={editDraft.stem} onChange={(e)=>setED("stem",e.target.value)} /></div>
-                          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
-                            <div><label style={lbl}>내 답</label><input style={field} value={editDraft.myAnswer} onChange={(e)=>setED("myAnswer",e.target.value)} /></div>
-                            <div><label style={lbl}>정답*</label><input style={field} value={editDraft.correct}  onChange={(e)=>setED("correct",e.target.value)} /></div>
-                          </div>
-                          <div>
-                            <label style={lbl}>오답유형*</label>
-                            <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
-                              {ERROR_TYPES.map((e) => {
-                                const on = editDraft.errorType === e.id;
-                                return (
-                                  <button key={e.id} className="tap" onClick={()=>setED("errorType",e.id)}
-                                    style={{ background: on?e.color:`${e.color}1a`, color: on?"#14110f":e.color,
-                                      border:`1px solid ${e.color}66`, borderRadius:7, padding:"5px 10px", fontSize:12.5, fontWeight:600 }}>
-                                    {e.kr}
-                                  </button>
-                                );
-                              })}
-                            </div>
-                          </div>
-                          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
-                            <div><label style={lbl}>과목</label>
-                              <select style={field} value={editDraft.system} onChange={(e)=>setED("system",e.target.value)}>
-                                {SYSTEMS.map((s)=><option key={s} value={s}>{s}</option>)}
-                              </select>
-                            </div>
-                            <div><label style={lbl}>확신도 · {editDraft.confidence}</label>
-                              <input type="range" min={1} max={5} value={editDraft.confidence}
-                                onChange={(e)=>setED("confidence",+e.target.value)} style={{ width:"100%", accentColor:C.amber, marginTop:9 }} />
-                            </div>
-                          </div>
-                          <div><label style={lbl}>기전</label><textarea style={{ ...field, minHeight:44 }} value={editDraft.pathophys} onChange={(e)=>setED("pathophys",e.target.value)} /></div>
-                          <div><label style={lbl}>함정</label><textarea style={{ ...field, minHeight:44 }} value={editDraft.trap}      onChange={(e)=>setED("trap",e.target.value)} /></div>
-                          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
-                            <div><label style={lbl}>Buzzwords</label><input style={field} value={editDraft.buzzword} onChange={(e)=>setED("buzzword",e.target.value)} /></div>
-                            <div><label style={lbl}>출처</label><input style={field} value={editDraft.source} onChange={(e)=>setED("source",e.target.value)} /></div>
-                          </div>
-                          <div style={{ borderTop:`1px solid ${C.line}`, paddingTop:10 }}>
-                            <label style={lbl}>트릴링구얼 해설</label>
-                            <div style={{ display:"grid", gap:7 }}>
-                              <input style={field} value={editDraft.content_kr} onChange={(e)=>setED("content_kr",e.target.value)} placeholder="🇰🇷 한국어" />
-                              <input style={field} value={editDraft.content_uz} onChange={(e)=>setED("content_uz",e.target.value)} placeholder="🇺🇿 O'zbekcha" />
-                              <input style={field} value={editDraft.content_en} onChange={(e)=>setED("content_en",e.target.value)} placeholder="🇬🇧 English" />
-                            </div>
-                          </div>
-                          <div style={{ display:"flex", gap:9 }}>
-                            <button className="tap" onClick={()=>saveEdit(c.id)}
-                              style={{ background:C.amber, color:"#14110f", border:"none", borderRadius:9, padding:"10px 20px", fontSize:14, fontWeight:700 }}>저장</button>
-                            <button className="tap" onClick={()=>{setEditing(null);setEditDraft(null);}}
-                              style={{ background:"transparent", color:C.dim, border:`1px solid ${C.line}`, borderRadius:9, padding:"10px 16px", fontSize:14 }}>취소</button>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-          }
-        </div>
-      );
+      }
+      flash('삭제됨');
+    });
+  };
+  const startEdit = card => {
+    setEditDraft({
+      stem: card.stem,
+      myAnswer: card.myAnswer || '',
+      correct: card.correct,
+      errorType: card.errorType,
+      system: card.system,
+      pathophys: card.pathophys || '',
+      trap: card.trap || '',
+      buzzword: (card.buzzword || []).join(', '),
+      source: card.source || '',
+      confidence: card.confidence || 3,
+      content_kr: card.content_kr || '',
+      content_uz: card.content_uz || '',
+      content_en: card.content_en || '',
+      hasMcq: !!card.originalMcq,
+      mcqStem: card.originalMcq?.stemFull || '',
+      mcqOptions: card.originalMcq?.options?.length ? [...card.originalMcq.options] : ['', '', '', ''],
+      mcqAnswerIndex: card.originalMcq?.answerIndex || 0
+    });
+    setEditing(card.id);
+    setExpanded(null);
+  };
+  const aiAutofillEdit = async () => {
+    if (!editDraft?.stem || !editDraft?.correct) {
+      flash('stem과 정답을 먼저 입력');
+      return;
     }
-
-    /* ============================================================
-       DASHBOARD
-       ============================================================ */
-    function Dashboard({ cards }) {
-      const total    = cards.length;
-      const due      = cards.filter(isDue).length;
-      const mastered = cards.filter((c) => c.srs && c.srs.interval >= 21).length;
-
-      const byError  = ERROR_TYPES.map((e) => ({ ...e, n: cards.filter((c)=>c.errorType===e.id).length })).filter((e)=>e.n>0);
-      const bySystem = SYSTEMS.map((s) => ({ s, n: cards.filter((c)=>c.system===s).length })).filter((x)=>x.n>0).sort((a,b)=>b.n-a.n);
-      const maxE = Math.max(1, ...byError.map((e)=>e.n));
-      const maxS = Math.max(1, ...bySystem.map((x)=>x.n));
-
-      const combo = {};
-      cards.forEach((c) => { const k=`${c.system}__${c.errorType}`; combo[k]=(combo[k]||0)+1; });
-      const topCombo = Object.entries(combo).sort((a,b)=>b[1]-a[1])[0];
-
-      const stat = (n,l,col) => (
-        <div style={{ flex:1, background:C.panel, border:`1px solid ${C.line}`, borderRadius:11, padding:"16px 14px" }}>
-          <div className="serif" style={{ fontSize:30, fontWeight:600, color:col||C.text }}>{n}</div>
-          <div style={{ fontSize:12, color:C.dim, marginTop:2 }}>{l}</div>
-        </div>
-      );
-
-      return (
-        <div className="fade" style={{ display:"grid", gap:18 }}>
-          <div style={{ display:"flex", gap:10 }}>
-            {stat(total,"총 카드")}
-            {stat(due,"오늘 due", due ? C.amber : C.dim)}
-            {stat(mastered,"정착 (≥21d)", C.green)}
-          </div>
-          {topCombo && (
-            <div style={{ background:`${C.amber}14`, border:`1px solid ${C.amber}44`, borderRadius:11, padding:"13px 16px", fontSize:14 }}>
-              <span style={{ color:C.amber, fontWeight:700 }}>약점 패턴</span> · {topCombo[0].split("__")[0]} 과목의{" "}
-              <b>{ET[topCombo[0].split("__")[1]]?.kr}</b> 오답 {topCombo[1]}건 최다
-            </div>
-          )}
-          <div>
-            <div style={lbl}>오답 유형 분포</div>
-            <div style={{ display:"grid", gap:7, marginTop:8 }}>
-              {byError.map((e) => (
-                <div key={e.id} style={{ display:"flex", alignItems:"center", gap:10 }}>
-                  <div style={{ width:90, fontSize:13, color:e.color }}>{e.kr}</div>
-                  <div style={{ flex:1, background:C.bg, borderRadius:6, height:22, overflow:"hidden", border:`1px solid ${C.line}` }}>
-                    <div style={{ width:`${(e.n/maxE)*100}%`, height:"100%", background:e.color, minWidth:3 }} />
-                  </div>
-                  <div style={{ width:24, textAlign:"right", fontSize:13, color:C.dim }}>{e.n}</div>
-                </div>
-              ))}
-            </div>
-          </div>
-          <div>
-            <div style={lbl}>과목 분포</div>
-            <div style={{ display:"grid", gap:7, marginTop:8 }}>
-              {bySystem.map((x) => (
-                <div key={x.s} style={{ display:"flex", alignItems:"center", gap:10 }}>
-                  <div style={{ width:90, fontSize:13, color:C.text }}>{x.s}</div>
-                  <div style={{ flex:1, background:C.bg, borderRadius:6, height:22, overflow:"hidden", border:`1px solid ${C.line}` }}>
-                    <div style={{ width:`${(x.n/maxS)*100}%`, height:"100%", background:C.teal, minWidth:3 }} />
-                  </div>
-                  <div style={{ width:24, textAlign:"right", fontSize:13, color:C.dim }}>{x.n}</div>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      );
+    setAiLoading(true);
+    try {
+      const r = await aiEnrichCard(editDraft.stem, editDraft.correct, editDraft.myAnswer);
+      setEditDraft(p => ({
+        ...p,
+        pathophys: r.pathophys || p.pathophys,
+        trap: r.trap || p.trap,
+        content_kr: r.content_kr || p.content_kr,
+        content_uz: r.content_uz || p.content_uz,
+        content_en: r.content_en || p.content_en,
+        buzzword: r.buzzword || p.buzzword
+      }));
+      flash('✨ AI 자동완성 완료');
+    } catch (e) {
+      flash('AI 오류: ' + e.message);
+    } finally {
+      setAiLoading(false);
     }
-
-    /* ============================================================
-       EXPORT  (Anki TSV, trilingual)
-       ============================================================ */
-    function Export({ cards }) {
-      const taRef = useRef(null);
-      const [copied, setCopied] = useState(false);
-
-      const tsv = useMemo(() => {
-        return cards.map((c) => {
-          const front = c.stem;
-          const back = [
-            c.correct,
-            c.pathophys && `Pathophys: ${c.pathophys}`,
-            c.trap      && `Trap: ${c.trap}`,
-            c.buzzword?.length && `Buzz: ${c.buzzword.join(", ")}`,
-            c.content_kr && `[KR] ${c.content_kr}`,
-            c.content_uz && `[UZ] ${c.content_uz}`,
-            c.content_en && `[EN] ${c.content_en}`,
-          ].filter(Boolean).join("\\n");
-          return `${front}\t${back}`;
-        }).join("\n");
-      }, [cards]);
-
-      const copy = async () => {
-        try { await navigator.clipboard.writeText(tsv); }
-        catch (e) { if (taRef.current) { taRef.current.select(); document.execCommand("copy"); } }
-        setCopied(true); setTimeout(()=>setCopied(false), 1600);
-      };
-      const download = () => {
-        const blob = new Blob([tsv], { type:"text/tab-separated-values" });
-        const url  = URL.createObjectURL(blob);
-        const a    = document.createElement("a");
-        a.href = url; a.download = "usmle_anki.tsv"; a.click();
-        URL.revokeObjectURL(url);
-      };
-
-      return (
-        <div className="fade" style={{ display:"grid", gap:12, maxWidth:760 }}>
-          <div style={{ fontSize:13.5, color:C.dim }}>
-            Anki TSV · <span style={{ color:C.text }}>Front ⇥ Back</span> · Back 줄바꿈은{" "}
-            <code style={{ color:C.amber, background:`${C.amber}18`, padding:"1px 5px", borderRadius:4 }}>\n</code>
-            {" "}· 트릴링구얼 [KR][UZ][EN] 포함
-          </div>
-          <div style={{ display:"flex", gap:10 }}>
-            <button className="tap" onClick={copy}
-              style={{ background:C.amber, color:"#14110f", border:"none", borderRadius:9, padding:"10px 18px", fontWeight:700, fontSize:14 }}>
-              {copied ? "복사됨 ✓" : "TSV 복사"}
-            </button>
-            <button className="tap" onClick={download}
-              style={{ background:"transparent", color:C.text, border:`1px solid ${C.line2}`, borderRadius:9, padding:"10px 18px", fontSize:14 }}>
-              .tsv 다운로드
-            </button>
-            <div style={{ marginLeft:"auto", fontSize:12.5, color:C.faint, alignSelf:"center" }}>{cards.length} cards</div>
-          </div>
-          <textarea ref={taRef} readOnly value={tsv}
-            style={{ ...field, minHeight:240, fontFamily:"ui-monospace,monospace", fontSize:12.5, lineHeight:1.6, whiteSpace:"pre" }} />
-        </div>
-      );
+  };
+  const saveEdit = id => {
+    const d = editDraft;
+    if (!d.stem.trim() || !d.correct.trim() || !d.errorType) return;
+    const updated = cards.map(c => c.id !== id ? c : {
+      ...c,
+      stem: d.stem.trim(),
+      myAnswer: d.myAnswer.trim(),
+      correct: d.correct.trim(),
+      errorType: d.errorType,
+      system: d.system,
+      pathophys: d.pathophys.trim(),
+      trap: d.trap.trim(),
+      buzzword: d.buzzword.split(',').map(s => s.trim()).filter(Boolean),
+      source: d.source.trim(),
+      confidence: d.confidence,
+      content_kr: d.content_kr.trim(),
+      content_uz: d.content_uz.trim(),
+      content_en: d.content_en.trim(),
+      originalMcq: d.hasMcq ? {
+        stemFull: d.mcqStem.trim(),
+        options: d.mcqOptions.map(o => o.trim()).filter(Boolean),
+        answerIndex: d.mcqAnswerIndex
+      } : null
+    });
+    update(updated);
+    cloudSave(updated.find(c => c.id === id));
+    setEditing(null);
+    setEditDraft(null);
+    flash('수정 저장됨');
+  };
+  const toggle = id => {
+    if (editing === id) return;
+    setExpanded(p => p === id ? null : id);
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "fade",
+    style: {
+      display: 'grid',
+      gap: 14
     }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'grid',
+      gap: 9
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    style: {
+      ...field,
+      fontSize: 14
+    },
+    value: search,
+    onChange: e => setSearch(e.target.value),
+    placeholder: "\uD83D\uDD0D  stem \xB7 \uC815\uB2F5 \xB7 buzzword \uAC80\uC0C9\u2026"
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      flexWrap: 'wrap',
+      alignItems: 'center'
+    }
+  }, /*#__PURE__*/React.createElement("select", {
+    style: {
+      ...field,
+      width: 'auto',
+      fontSize: 13,
+      padding: '7px 11px'
+    },
+    value: sysFilter,
+    onChange: e => setSysFilter(e.target.value)
+  }, /*#__PURE__*/React.createElement("option", {
+    value: ""
+  }, "\uBAA8\uB4E0 \uACFC\uBAA9"), SYSTEMS.map(s => /*#__PURE__*/React.createElement("option", {
+    key: s,
+    value: s
+  }, s))), /*#__PURE__*/React.createElement("select", {
+    style: {
+      ...field,
+      width: 'auto',
+      fontSize: 13,
+      padding: '7px 11px'
+    },
+    value: sort,
+    onChange: e => setSort(e.target.value)
+  }, /*#__PURE__*/React.createElement("option", {
+    value: "default"
+  }, "\uCD5C\uC2E0\uC21C"), /*#__PURE__*/React.createElement("option", {
+    value: "dueDate"
+  }, "\uBCF5\uC2B5\uC77C\uC21C"), /*#__PURE__*/React.createElement("option", {
+    value: "system"
+  }, "\uACFC\uBAA9\uC21C"), /*#__PURE__*/React.createElement("option", {
+    value: "confidence"
+  }, "\uD655\uC2E0\uB3C4 \u2193")), /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: () => setDueOnly(p => !p),
+    style: {
+      background: dueOnly ? `${C.amber}22` : 'transparent',
+      color: dueOnly ? C.amber : C.dim,
+      border: `1px solid ${dueOnly ? C.amber : C.line2}`,
+      borderRadius: 8,
+      padding: '7px 13px',
+      fontSize: 13,
+      fontWeight: 600
+    }
+  }, "DUE\uB9CC"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginLeft: 'auto',
+      fontSize: 12,
+      color: C.dim
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.text,
+      fontWeight: 600
+    }
+  }, filtered.length), " / ", cards.length)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 6,
+      flexWrap: 'wrap'
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: () => setEtFilter(''),
+    style: {
+      background: !etFilter ? `${C.dim}22` : 'transparent',
+      color: !etFilter ? C.text : C.faint,
+      border: `1px solid ${!etFilter ? C.dim : C.line}`,
+      borderRadius: 20,
+      padding: '4px 11px',
+      fontSize: 12,
+      fontWeight: 600
+    }
+  }, "\uC804\uCCB4"), ERROR_TYPES.map(e => /*#__PURE__*/React.createElement("button", {
+    key: e.id,
+    className: "tap",
+    onClick: () => setEtFilter(p => p === e.id ? '' : e.id),
+    style: {
+      background: etFilter === e.id ? `${e.color}22` : 'transparent',
+      color: etFilter === e.id ? e.color : C.faint,
+      border: `1px solid ${etFilter === e.id ? e.color : C.line}`,
+      borderRadius: 20,
+      padding: '4px 11px',
+      fontSize: 12,
+      fontWeight: 600
+    }
+  }, e.kr)))), filtered.length === 0 ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: 'center',
+      padding: '48px 20px',
+      color: C.faint,
+      fontSize: 14
+    }
+  }, "\uCE74\uB4DC \uC5C6\uC74C") : /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'grid',
+      gap: 6
+    }
+  }, filtered.map(c => {
+    const et = ET[c.errorType],
+      due = isDue(c),
+      isExp = expanded === c.id,
+      isEd = editing === c.id;
+    return /*#__PURE__*/React.createElement("div", {
+      key: c.id,
+      style: {
+        border: `1px solid ${isEd ? `${C.amber}55` : isExp ? C.line2 : C.line}`,
+        borderRadius: 10,
+        overflow: 'hidden',
+        background: C.panel
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      onClick: () => !isEd && toggle(c.id),
+      style: {
+        display: 'flex',
+        gap: 10,
+        alignItems: 'center',
+        padding: '11px 13px',
+        cursor: isEd ? 'default' : 'pointer'
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        width: 4,
+        alignSelf: 'stretch',
+        borderRadius: 4,
+        flexShrink: 0,
+        background: et.color
+      }
+    }), /*#__PURE__*/React.createElement("div", {
+      style: {
+        flex: 1,
+        minWidth: 0
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 13.5,
+        lineHeight: 1.45,
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: isExp ? 'normal' : 'nowrap'
+      }
+    }, c.stem), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 12,
+        color: C.dim,
+        marginTop: 4,
+        display: 'flex',
+        gap: 8,
+        flexWrap: 'wrap',
+        alignItems: 'center'
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.teal,
+        fontWeight: 600
+      }
+    }, c.system), /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: et.color
+      }
+    }, et.kr), /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.green,
+        fontWeight: 500
+      }
+    }, "\u2192 ", c.correct), c.confidence >= 4 && /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.red,
+        fontSize: 11
+      }
+    }, "\uD655\uC2E0 ", c.confidence, " \u26A0"))), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: 'flex',
+        gap: 6,
+        flexShrink: 0,
+        alignItems: 'center'
+      }
+    }, due && /*#__PURE__*/React.createElement("span", {
+      style: {
+        background: `${C.amber}22`,
+        color: C.amber,
+        border: `1px solid ${C.amber}55`,
+        borderRadius: 12,
+        padding: '2px 8px',
+        fontSize: 11,
+        fontWeight: 700
+      }
+    }, "DUE"), c.srs?.interval && !due && /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 11,
+        color: C.faint
+      }
+    }, c.srs.interval, "d"), /*#__PURE__*/React.createElement("button", {
+      className: "tap",
+      onClick: e => {
+        e.stopPropagation();
+        startEdit(c);
+      },
+      style: {
+        background: 'transparent',
+        border: `1px solid ${C.line2}`,
+        color: C.dim,
+        borderRadius: 6,
+        padding: '4px 9px',
+        fontSize: 12
+      }
+    }, "\uC218\uC815"), /*#__PURE__*/React.createElement("button", {
+      className: "tap",
+      onClick: e => {
+        e.stopPropagation();
+        del(c.id);
+      },
+      style: {
+        background: 'transparent',
+        border: `1px solid ${C.line}`,
+        color: C.faint,
+        borderRadius: 6,
+        padding: '4px 9px',
+        fontSize: 12
+      }
+    }, "\u2715"))), isExp && /*#__PURE__*/React.createElement("div", {
+      className: "fade",
+      style: {
+        borderTop: `1px solid ${C.line}`,
+        padding: '14px 16px',
+        background: C.bg,
+        display: 'grid',
+        gap: 6
+      }
+    }, /*#__PURE__*/React.createElement(DetailRow, {
+      k: "\uB0B4 \uB2F5",
+      v: c.myAnswer,
+      color: C.red
+    }), /*#__PURE__*/React.createElement(DetailRow, {
+      k: "\uC815\uB2F5",
+      v: c.correct,
+      color: C.green,
+      strong: true
+    }), /*#__PURE__*/React.createElement(DetailRow, {
+      k: "\uAE30\uC804",
+      v: c.pathophys
+    }), /*#__PURE__*/React.createElement(DetailRow, {
+      k: "\uD568\uC815",
+      v: c.trap,
+      color: C.amber
+    }), c.buzzword?.length > 0 && /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: 'flex',
+        gap: 5,
+        flexWrap: 'wrap',
+        marginTop: 2
+      }
+    }, c.buzzword.map((b, i) => /*#__PURE__*/React.createElement(Badge, {
+      key: i,
+      color: C.teal
+    }, b))), (c.content_kr || c.content_uz || c.content_en) && /*#__PURE__*/React.createElement("div", {
+      style: {
+        borderTop: `1px solid ${C.line}`,
+        paddingTop: 8,
+        marginTop: 4,
+        display: 'grid',
+        gap: 5,
+        fontSize: 13
+      }
+    }, c.content_kr && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.faint
+      }
+    }, "\uD83C\uDDF0\uD83C\uDDF7 "), c.content_kr), c.content_uz && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.faint
+      }
+    }, "\uD83C\uDDFA\uD83C\uDDFF "), c.content_uz), c.content_en && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.faint
+      }
+    }, "\uD83C\uDDEC\uD83C\uDDE7 "), c.content_en)), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11.5,
+        color: C.faint,
+        marginTop: 4,
+        display: 'flex',
+        gap: 16,
+        flexWrap: 'wrap'
+      }
+    }, /*#__PURE__*/React.createElement("span", null, "\uCD9C\uCC98: ", c.source || '—'), /*#__PURE__*/React.createElement("span", null, "\uD655\uC2E0\uB3C4: ", c.confidence, "/5"), /*#__PURE__*/React.createElement("span", null, "SRS: ", c.srs ? `${c.srs.interval}d / ease ${c.srs.ease} / reps ${c.srs.reps}` : '신규'), c.originalMcq && /*#__PURE__*/React.createElement("span", null, "MCQ: ", c.originalMcq.options.length, "\uC9C0"))), isEd && editDraft && /*#__PURE__*/React.createElement("div", {
+      className: "fade",
+      style: {
+        borderTop: `1px solid ${C.amber}44`,
+        padding: '16px',
+        background: C.bg,
+        display: 'grid',
+        gap: 11
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between'
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 12,
+        color: C.amber,
+        fontWeight: 700
+      }
+    }, "\uC218\uC815 \uBAA8\uB4DC \xB7 Edit"), /*#__PURE__*/React.createElement("button", {
+      className: "tap",
+      onClick: aiAutofillEdit,
+      disabled: aiLoading,
+      style: {
+        background: aiLoading ? `${C.amber}44` : C.amber,
+        color: '#14110f',
+        border: 'none',
+        borderRadius: 8,
+        padding: '5px 13px',
+        fontSize: 12,
+        fontWeight: 700
+      }
+    }, aiLoading ? '✨ 생성 중…' : '✨ AI 자동완성')), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+      style: lbl
+    }, "Stem*"), /*#__PURE__*/React.createElement("textarea", {
+      style: {
+        ...field,
+        minHeight: 52
+      },
+      value: editDraft.stem,
+      onChange: e => setED('stem', e.target.value)
+    })), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: 'grid',
+        gridTemplateColumns: '1fr 1fr',
+        gap: 10
+      }
+    }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+      style: lbl
+    }, "\uB0B4 \uB2F5"), /*#__PURE__*/React.createElement("input", {
+      style: field,
+      value: editDraft.myAnswer,
+      onChange: e => setED('myAnswer', e.target.value)
+    })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+      style: lbl
+    }, "\uC815\uB2F5*"), /*#__PURE__*/React.createElement("input", {
+      style: field,
+      value: editDraft.correct,
+      onChange: e => setED('correct', e.target.value)
+    }))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+      style: lbl
+    }, "\uC624\uB2F5\uC720\uD615*"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: 'flex',
+        gap: 6,
+        flexWrap: 'wrap'
+      }
+    }, ERROR_TYPES.map(e => {
+      const on = editDraft.errorType === e.id;
+      return /*#__PURE__*/React.createElement("button", {
+        key: e.id,
+        className: "tap",
+        onClick: () => setED('errorType', e.id),
+        style: {
+          background: on ? e.color : `${e.color}1a`,
+          color: on ? '#14110f' : e.color,
+          border: `1px solid ${e.color}66`,
+          borderRadius: 7,
+          padding: '5px 10px',
+          fontSize: 12.5,
+          fontWeight: 600
+        }
+      }, e.kr);
+    }))), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: 'grid',
+        gridTemplateColumns: '1fr 1fr',
+        gap: 10
+      }
+    }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+      style: lbl
+    }, "\uACFC\uBAA9"), /*#__PURE__*/React.createElement("select", {
+      style: field,
+      value: editDraft.system,
+      onChange: e => setED('system', e.target.value)
+    }, SYSTEMS.map(s => /*#__PURE__*/React.createElement("option", {
+      key: s,
+      value: s
+    }, s)))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+      style: lbl
+    }, "\uD655\uC2E0\uB3C4 \xB7 ", editDraft.confidence), /*#__PURE__*/React.createElement("input", {
+      type: "range",
+      min: 1,
+      max: 5,
+      value: editDraft.confidence,
+      onChange: e => setED('confidence', +e.target.value),
+      style: {
+        width: '100%',
+        accentColor: C.amber,
+        marginTop: 9
+      }
+    }))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+      style: lbl
+    }, "\uAE30\uC804"), /*#__PURE__*/React.createElement("textarea", {
+      style: {
+        ...field,
+        minHeight: 44
+      },
+      value: editDraft.pathophys,
+      onChange: e => setED('pathophys', e.target.value)
+    })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+      style: lbl
+    }, "\uD568\uC815"), /*#__PURE__*/React.createElement("textarea", {
+      style: {
+        ...field,
+        minHeight: 44
+      },
+      value: editDraft.trap,
+      onChange: e => setED('trap', e.target.value)
+    })), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: 'grid',
+        gridTemplateColumns: '1fr 1fr',
+        gap: 10
+      }
+    }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+      style: lbl
+    }, "Buzzwords"), /*#__PURE__*/React.createElement("input", {
+      style: field,
+      value: editDraft.buzzword,
+      onChange: e => setED('buzzword', e.target.value)
+    })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+      style: lbl
+    }, "\uCD9C\uCC98"), /*#__PURE__*/React.createElement("input", {
+      style: field,
+      value: editDraft.source,
+      onChange: e => setED('source', e.target.value)
+    }))), /*#__PURE__*/React.createElement("div", {
+      style: {
+        borderTop: `1px solid ${C.line}`,
+        paddingTop: 10
+      }
+    }, /*#__PURE__*/React.createElement("label", {
+      style: lbl
+    }, "\uD2B8\uB9B4\uB9C1\uAD6C\uC5BC \uD574\uC124"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: 'grid',
+        gap: 7
+      }
+    }, /*#__PURE__*/React.createElement("input", {
+      style: field,
+      value: editDraft.content_kr,
+      onChange: e => setED('content_kr', e.target.value),
+      placeholder: "\uD83C\uDDF0\uD83C\uDDF7 \uD55C\uAD6D\uC5B4"
+    }), /*#__PURE__*/React.createElement("input", {
+      style: field,
+      value: editDraft.content_uz,
+      onChange: e => setED('content_uz', e.target.value),
+      placeholder: "\uD83C\uDDFA\uD83C\uDDFF O'zbekcha"
+    }), /*#__PURE__*/React.createElement("input", {
+      style: field,
+      value: editDraft.content_en,
+      onChange: e => setED('content_en', e.target.value),
+      placeholder: "\uD83C\uDDEC\uD83C\uDDE7 English"
+    }))), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: 'flex',
+        gap: 9
+      }
+    }, /*#__PURE__*/React.createElement("button", {
+      className: "tap",
+      onClick: () => saveEdit(c.id),
+      style: {
+        background: C.amber,
+        color: '#14110f',
+        border: 'none',
+        borderRadius: 9,
+        padding: '10px 20px',
+        fontSize: 14,
+        fontWeight: 700
+      }
+    }, "\uC800\uC7A5"), /*#__PURE__*/React.createElement("button", {
+      className: "tap",
+      onClick: () => {
+        setEditing(null);
+        setEditDraft(null);
+      },
+      style: {
+        background: 'transparent',
+        color: C.dim,
+        border: `1px solid ${C.line}`,
+        borderRadius: 9,
+        padding: '10px 16px',
+        fontSize: 14
+      }
+    }, "\uCDE8\uC18C"))));
+  })));
+}
 
-    /* ---- mount ---- */
-    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
-  </script>
+/* ============================================================
+   DASHBOARD
+   ============================================================ */
+function Dashboard({
+  cards
+}) {
+  const total = cards.length,
+    due = cards.filter(isDue).length,
+    mastered = cards.filter(c => c.srs && c.srs.interval >= 21).length;
+  const byError = ERROR_TYPES.map(e => ({
+    ...e,
+    n: cards.filter(c => c.errorType === e.id).length
+  })).filter(e => e.n > 0);
+  const bySystem = SYSTEMS.map(s => ({
+    s,
+    n: cards.filter(c => c.system === s).length
+  })).filter(x => x.n > 0).sort((a, b) => b.n - a.n);
+  const maxE = Math.max(1, ...byError.map(e => e.n)),
+    maxS = Math.max(1, ...bySystem.map(x => x.n));
+  const combo = {};
+  cards.forEach(c => {
+    const k = `${c.system}__${c.errorType}`;
+    combo[k] = (combo[k] || 0) + 1;
+  });
+  const topCombo = Object.entries(combo).sort((a, b) => b[1] - a[1])[0];
+  const stat = (n, l, col) => /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1,
+      background: C.panel,
+      border: `1px solid ${C.line}`,
+      borderRadius: 11,
+      padding: '16px 14px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "serif",
+    style: {
+      fontSize: 30,
+      fontWeight: 600,
+      color: col || C.text
+    }
+  }, n), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.dim,
+      marginTop: 2
+    }
+  }, l));
+  return /*#__PURE__*/React.createElement("div", {
+    className: "fade",
+    style: {
+      display: 'grid',
+      gap: 18
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 10
+    }
+  }, stat(total, '총 카드'), stat(due, '오늘 due', due ? C.amber : C.dim), stat(mastered, '정착 (≥21d)', C.green)), topCombo && /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: `${C.amber}14`,
+      border: `1px solid ${C.amber}44`,
+      borderRadius: 11,
+      padding: '13px 16px',
+      fontSize: 14
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.amber,
+      fontWeight: 700
+    }
+  }, "\uC57D\uC810 \uD328\uD134"), " \xB7 ", topCombo[0].split('__')[0], " \uACFC\uBAA9\uC758", ' ', /*#__PURE__*/React.createElement("b", null, ET[topCombo[0].split('__')[1]]?.kr), " \uC624\uB2F5 ", topCombo[1], "\uAC74 \uCD5C\uB2E4"), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: lbl
+  }, "\uC624\uB2F5 \uC720\uD615 \uBD84\uD3EC"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'grid',
+      gap: 7,
+      marginTop: 8
+    }
+  }, byError.map(e => /*#__PURE__*/React.createElement("div", {
+    key: e.id,
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 90,
+      fontSize: 13,
+      color: e.color
+    }
+  }, e.kr), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1,
+      background: C.bg,
+      borderRadius: 6,
+      height: 22,
+      overflow: 'hidden',
+      border: `1px solid ${C.line}`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: `${e.n / maxE * 100}%`,
+      height: '100%',
+      background: e.color,
+      minWidth: 3
+    }
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 24,
+      textAlign: 'right',
+      fontSize: 13,
+      color: C.dim
+    }
+  }, e.n))))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: lbl
+  }, "\uACFC\uBAA9 \uBD84\uD3EC"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'grid',
+      gap: 7,
+      marginTop: 8
+    }
+  }, bySystem.map(x => /*#__PURE__*/React.createElement("div", {
+    key: x.s,
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 90,
+      fontSize: 13,
+      color: C.text
+    }
+  }, x.s), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1,
+      background: C.bg,
+      borderRadius: 6,
+      height: 22,
+      overflow: 'hidden',
+      border: `1px solid ${C.line}`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: `${x.n / maxS * 100}%`,
+      height: '100%',
+      background: C.teal,
+      minWidth: 3
+    }
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 24,
+      textAlign: 'right',
+      fontSize: 13,
+      color: C.dim
+    }
+  }, x.n))))));
+}
+
+/* ============================================================
+   EXPORT  (Anki TSV + JSON 백업 + Excel)
+   ============================================================ */
+function Export({
+  cards,
+  flash
+}) {
+  const taRef = useRef(null);
+  const fileRef = useRef(null);
+  const [copied, setCopied] = useState(false);
+  const [importMode, setImportMode] = useState(false);
+  const tsv = useMemo(() => cards.map(c => {
+    const back = [c.correct, c.pathophys && `Pathophys: ${c.pathophys}`, c.trap && `Trap: ${c.trap}`, c.buzzword?.length && `Buzz: ${c.buzzword.join(', ')}`, c.content_kr && `[KR] ${c.content_kr}`, c.content_uz && `[UZ] ${c.content_uz}`, c.content_en && `[EN] ${c.content_en}`].filter(Boolean).join('\\n');
+    return `${c.stem}\t${back}`;
+  }).join('\n'), [cards]);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(tsv);
+    } catch (e) {
+      if (taRef.current) {
+        taRef.current.select();
+        document.execCommand('copy');
+      }
+    }
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1600);
+  };
+  const dlTsv = () => {
+    _download(new Blob([tsv], {
+      type: 'text/tab-separated-values'
+    }), 'usmle_anki.tsv');
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "fade",
+    style: {
+      display: 'grid',
+      gap: 16,
+      maxWidth: 760
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'grid',
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: C.dim,
+      fontWeight: 600,
+      textTransform: 'uppercase',
+      letterSpacing: '.05em'
+    }
+  }, "\uB0B4\uBCF4\uB0B4\uAE30 \xB7 Export"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 9,
+      flexWrap: 'wrap'
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: copy,
+    style: {
+      background: C.amber,
+      color: '#14110f',
+      border: 'none',
+      borderRadius: 9,
+      padding: '10px 16px',
+      fontWeight: 700,
+      fontSize: 14
+    }
+  }, copied ? '복사됨 ✓' : 'Anki TSV 복사'), /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: dlTsv,
+    style: {
+      background: 'transparent',
+      color: C.text,
+      border: `1px solid ${C.line2}`,
+      borderRadius: 9,
+      padding: '10px 16px',
+      fontSize: 14
+    }
+  }, ".tsv \uB2E4\uC6B4\uB85C\uB4DC"), /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: () => exportJSON(cards),
+    style: {
+      background: 'transparent',
+      color: C.teal,
+      border: `1px solid ${C.teal}55`,
+      borderRadius: 9,
+      padding: '10px 16px',
+      fontSize: 14,
+      fontWeight: 600
+    }
+  }, "\uD83D\uDCE6 JSON \uC804\uCCB4 \uBC31\uC5C5"), /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: () => exportExcel(cards),
+    style: {
+      background: 'transparent',
+      color: '#4ade80',
+      border: `1px solid #4ade8055`,
+      borderRadius: 9,
+      padding: '10px 16px',
+      fontSize: 14,
+      fontWeight: 600
+    }
+  }, "\uD83D\uDCCA Excel (.xlsx)")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.faint
+    }
+  }, cards.length, " cards \xB7 Anki Back \uC904\uBC14\uAFC8: ", /*#__PURE__*/React.createElement("code", {
+    style: {
+      color: C.amber,
+      background: `${C.amber}18`,
+      padding: '1px 5px',
+      borderRadius: 4
+    }
+  }, '\\n'), " \xB7 [KR][UZ][EN] \uD3EC\uD568")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      borderTop: `1px solid ${C.line}`,
+      paddingTop: 14
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: C.dim,
+      fontWeight: 600,
+      textTransform: 'uppercase',
+      letterSpacing: '.05em',
+      marginBottom: 10
+    }
+  }, "\uAC00\uC838\uC624\uAE30 \xB7 Import"), /*#__PURE__*/React.createElement("input", {
+    ref: fileRef,
+    type: "file",
+    accept: ".json",
+    style: {
+      display: 'none'
+    },
+    onChange: e => {
+      const f = e.target.files?.[0];
+      if (!f) return;
+      const reader = new FileReader();
+      reader.onload = ev => {
+        try {
+          const d = JSON.parse(ev.target.result);
+          const imported = d.cards || d;
+          if (!Array.isArray(imported)) throw new Error('cards 배열 없음');
+          showConfirm(`JSON에서 ${imported.length}개 카드를 가져올까요?<br><span style="font-size:11px;color:#9a9088">기존 카드와 병합됩니다 (중복 ID는 덮어씁니다)</span>`, () => {
+            const existingIds = new Set(cards.map(c => c.id));
+            const merged = [...imported, ...cards.filter(c => !imported.find(i => i.id === c.id))];
+            saveStore(merged);
+            window.location.reload();
+          });
+        } catch (err) {
+          flash('JSON 파싱 오류: ' + err.message);
+        }
+      };
+      reader.readAsText(f);
+      e.target.value = '';
+    }
+  }), /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: () => fileRef.current?.click(),
+    style: {
+      background: `${C.teal}1a`,
+      color: C.teal,
+      border: `1px solid ${C.teal}55`,
+      borderRadius: 9,
+      padding: '10px 16px',
+      fontSize: 14,
+      fontWeight: 600
+    }
+  }, "\uD83D\uDCC2 JSON \uBC31\uC5C5 \uBD88\uB7EC\uC624\uAE30")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      borderTop: `1px solid ${C.line}`,
+      paddingTop: 14
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: C.dim,
+      fontWeight: 600,
+      textTransform: 'uppercase',
+      letterSpacing: '.05em',
+      marginBottom: 10
+    }
+  }, "Anki TSV \uBBF8\uB9AC\uBCF4\uAE30"), /*#__PURE__*/React.createElement("textarea", {
+    ref: taRef,
+    readOnly: true,
+    value: tsv,
+    style: {
+      ...field,
+      minHeight: 200,
+      fontFamily: 'ui-monospace,monospace',
+      fontSize: 12,
+      lineHeight: 1.6,
+      whiteSpace: 'pre'
+    }
+  })));
+}
+
+/* ============================================================
+   SETTINGS  (Supabase 동기화 + AI API 설정 + 데이터 관리)
+   ============================================================ */
+function Settings({
+  cards,
+  update,
+  flash
+}) {
+  const sbCfg0 = getSbCfg() || {};
+  const aiCfg0 = getAICfg();
+  const [sbUrl, setSbUrl] = useState(sbCfg0.url || '');
+  const [sbKey, setSbKey] = useState(sbCfg0.key || '');
+  const [sbStatus, setSbStatus] = useState(getSbCfg() ? '✅ 연결됨' : '미설정');
+  const [sbLoading, setSbLoading] = useState(false);
+  const [aiAnthKey, setAiAnthKey] = useState(aiCfg0.anthropicKey || '');
+  const [aiOAIKey, setAiOAIKey] = useState(aiCfg0.openaiKey || '');
+  const [aiGemKey, setAiGemKey] = useState(aiCfg0.geminiKey || '');
+  const saveSb = () => {
+    if (!sbUrl.trim() || !sbKey.trim()) {
+      flash('URL과 anon 키를 입력해주세요');
+      return;
+    }
+    saveSbCfg(sbUrl.trim(), sbKey.trim());
+    setSbStatus('✅ 연결됨 (저장됨)');
+    flash('Supabase 설정 저장됨');
+  };
+  const testSb = async () => {
+    if (!sbUrl.trim() || !sbKey.trim()) {
+      flash('먼저 저장하세요');
+      return;
+    }
+    saveSbCfg(sbUrl.trim(), sbKey.trim());
+    setSbLoading(true);
+    try {
+      await sbTest();
+      setSbStatus('✅ 연결 성공');
+      flash('Supabase 연결 성공!');
+    } catch (e) {
+      setSbStatus('❌ 연결 실패: ' + e.message);
+      flash('연결 실패: ' + e.message);
+    }
+    setSbLoading(false);
+  };
+  const pushToCloud = async () => {
+    if (!getSbCfg()) {
+      flash('먼저 Supabase 설정을 저장하세요');
+      return;
+    }
+    setSbLoading(true);
+    try {
+      const n = await sbPushAll(cards);
+      flash(`⬆️ ${n}개 카드를 클라우드로 전송 완료`);
+    } catch (e) {
+      flash('Push 실패: ' + e.message);
+    }
+    setSbLoading(false);
+  };
+  const pullFromCloud = async () => {
+    if (!getSbCfg()) {
+      flash('먼저 Supabase 설정을 저장하세요');
+      return;
+    }
+    setSbLoading(true);
+    try {
+      const cloudCards = await sbLoadAll();
+      if (!cloudCards || cloudCards.length === 0) {
+        flash('클라우드에 데이터가 없습니다');
+        setSbLoading(false);
+        return;
+      }
+      showConfirm(`클라우드에서 ${cloudCards.length}개 카드를 가져올까요?<br><span style="font-size:11px;color:#9a9088">로컬 데이터를 클라우드 데이터로 교체합니다</span>`, () => {
+        update(cloudCards);
+        flash(`⬇️ ${cloudCards.length}개 카드를 클라우드에서 불러옴`);
+      });
+    } catch (e) {
+      flash('Pull 실패: ' + e.message);
+    }
+    setSbLoading(false);
+  };
+  const disconnectSb = () => {
+    showConfirm('Supabase 연결을 해제할까요?<br><span style="font-size:11px;color:#9a9088">로컬 데이터는 유지됩니다</span>', () => {
+      localStorage.removeItem(SB_CFG_KEY);
+      setSbUrl('');
+      setSbKey('');
+      setSbStatus('미설정');
+      flash('Supabase 연결 해제됨');
+    });
+  };
+  const saveAI = () => {
+    saveAICfg({
+      anthropicKey: aiAnthKey.trim(),
+      openaiKey: aiOAIKey.trim(),
+      geminiKey: aiGemKey.trim(),
+      modelAnthropic: 'claude-sonnet-4-6',
+      modelOpenAI: 'gpt-4o-mini',
+      modelGemini: 'gemini-2.0-flash'
+    });
+    flash('AI API 설정 저장됨');
+  };
+  const testAI = async () => {
+    saveAI();
+    try {
+      const r = await callAI('Respond with exactly: "OK"', 20);
+      flash('AI 연결 성공: ' + r.trim().slice(0, 30));
+    } catch (e) {
+      flash('AI 연결 실패: ' + e.message);
+    }
+  };
+  const clearAll = () => {
+    showConfirm('모든 카드 데이터를 삭제할까요?<br><span style="font-size:11px;color:#f85149">되돌릴 수 없습니다. 먼저 백업을 권장합니다.</span>', () => {
+      update([]);
+      flash('전체 데이터 삭제됨');
+    });
+  };
+  const sec = title => /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.dim,
+      fontWeight: 700,
+      textTransform: 'uppercase',
+      letterSpacing: '.06em',
+      marginBottom: 10,
+      marginTop: 6
+    }
+  }, title);
+  const inp = (val, set, placeholder, type = 'text') => /*#__PURE__*/React.createElement("input", {
+    type: type,
+    style: {
+      ...field,
+      marginBottom: 8
+    },
+    value: val,
+    onChange: e => set(e.target.value),
+    placeholder: placeholder
+  });
+  const btn = (label, onClick, color = C.teal, disabled = false) => /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: onClick,
+    disabled: disabled,
+    style: {
+      flex: 1,
+      background: disabled ? `${color}22` : `${color}1a`,
+      color: disabled ? C.faint : color,
+      border: `1px solid ${color}${disabled ? '33' : '66'}`,
+      borderRadius: 8,
+      padding: '10px',
+      fontSize: 13,
+      fontWeight: 700
+    }
+  }, label);
+  return /*#__PURE__*/React.createElement("div", {
+    className: "fade",
+    style: {
+      display: 'grid',
+      gap: 20,
+      maxWidth: 600
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: C.panel,
+      border: `1px solid ${C.line}`,
+      borderRadius: 12,
+      padding: 18
+    }
+  }, sec('☁ Supabase 클라우드 동기화'), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: C.dim,
+      marginBottom: 12,
+      lineHeight: 1.6
+    }
+  }, "\uD3F0\xB7PC\xB7\uD0DC\uBE14\uB9BF \uC5B4\uB514\uC11C\uB098 \uAC19\uC740 \uCE74\uB4DC \uC0AC\uC6A9 \uAC00\uB2A5.", /*#__PURE__*/React.createElement("br", null), "\uC0C1\uD0DC: ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: sbStatus.includes('✅') ? C.green : C.red,
+      fontWeight: 600
+    }
+  }, sbLoading ? '처리 중…' : sbStatus)), inp(sbUrl, setSbUrl, 'https://xxxx.supabase.co'), inp(sbKey, setSbKey, 'anon public key (eyJ…)', 'password'), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      marginBottom: 8
+    }
+  }, btn('💾 저장', saveSb), btn('🔄 테스트', testSb, C.green, sbLoading)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      marginBottom: 8
+    }
+  }, btn('⬆️ 로컬→클라우드', pushToCloud, C.amber, sbLoading), btn('⬇️ 클라우드→로컬', pullFromCloud, C.teal, sbLoading)), getSbCfg() && /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: disconnectSb,
+    style: {
+      width: '100%',
+      background: 'rgba(248,81,73,0.08)',
+      border: '1px solid #f85149',
+      borderRadius: 8,
+      padding: '9px',
+      color: '#f85149',
+      fontSize: 12.5,
+      fontWeight: 600
+    }
+  }, "\uD83D\uDD0C \uC5F0\uACB0 \uD574\uC81C"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 12,
+      padding: 10,
+      background: C.bg,
+      borderRadius: 8,
+      fontSize: 11.5,
+      color: C.faint,
+      lineHeight: 1.8
+    }
+  }, /*#__PURE__*/React.createElement("b", {
+    style: {
+      color: C.dim
+    }
+  }, "Supabase \uD14C\uC774\uBE14 \uC124\uC815 SQL (\uCD5C\uCD08 1\uD68C):"), /*#__PURE__*/React.createElement("br", null), /*#__PURE__*/React.createElement("code", {
+    style: {
+      color: C.amber
+    }
+  }, "CREATE TABLE usmle_cards (id text PRIMARY KEY, data text NOT NULL);", /*#__PURE__*/React.createElement("br", null), "ALTER TABLE usmle_cards ENABLE ROW LEVEL SECURITY;", /*#__PURE__*/React.createElement("br", null), "CREATE POLICY \"allow_all\" ON usmle_cards FOR ALL USING (true) WITH CHECK (true);"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: C.panel,
+      border: `1px solid ${C.line}`,
+      borderRadius: 12,
+      padding: 18
+    }
+  }, sec('🤖 AI API 설정'), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: C.dim,
+      marginBottom: 12,
+      lineHeight: 1.6
+    }
+  }, "claude.ai\uC5D0\uC11C \uC5F4\uBA74 ", /*#__PURE__*/React.createElement("b", {
+    style: {
+      color: C.teal
+    }
+  }, "\uD0A4 \uC5C6\uC774 Claude \uB0B4\uC7A5 AI"), " \uC790\uB3D9 \uC0AC\uC6A9.", /*#__PURE__*/React.createElement("br", null), "\uC678\uBD80 \uBE0C\uB77C\uC6B0\uC800(\uB85C\uCEEC/GitHub Pages)\uC5D0\uC11C\uB294 \uC544\uB798 \uD0A4 \uC911 \uD558\uB098 \uB4F1\uB85D."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 6,
+      alignItems: 'center',
+      marginBottom: 4
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: '#d97757',
+      fontWeight: 600
+    }
+  }, "Anthropic"), aiAnthKey && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10,
+      color: C.green
+    }
+  }, "\u2705 \uB4F1\uB85D\uB428")), inp(aiAnthKey, setAiAnthKey, 'sk-ant-api03-…', 'password'), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 6,
+      alignItems: 'center',
+      marginBottom: 4
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: '#74aa9c',
+      fontWeight: 600
+    }
+  }, "OpenAI"), aiOAIKey && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10,
+      color: C.green
+    }
+  }, "\u2705 \uB4F1\uB85D\uB428")), inp(aiOAIKey, setAiOAIKey, 'sk-…', 'password'), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 6,
+      alignItems: 'center',
+      marginBottom: 4
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: '#fbbf24',
+      fontWeight: 600
+    }
+  }, "Google Gemini"), aiGemKey && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10,
+      color: C.green
+    }
+  }, "\u2705 \uB4F1\uB85D\uB428")), inp(aiGemKey, setAiGemKey, 'AIza…', 'password'), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8
+    }
+  }, btn('💾 저장', saveAI), btn('🔌 연결 테스트', testAI, C.green))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: C.panel,
+      border: `1px solid ${C.line}`,
+      borderRadius: 12,
+      padding: 18
+    }
+  }, sec('📂 데이터 관리'), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: C.dim,
+      marginBottom: 12
+    }
+  }, "\uC800\uC7A5 \uC704\uCE58: localStorage \xB7 \uCE74\uB4DC \uC218: ", /*#__PURE__*/React.createElement("b", {
+    style: {
+      color: C.text
+    }
+  }, cards.length)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      flexWrap: 'wrap'
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: () => exportJSON(cards),
+    style: {
+      flex: 1,
+      background: `${C.teal}1a`,
+      color: C.teal,
+      border: `1px solid ${C.teal}55`,
+      borderRadius: 8,
+      padding: '10px',
+      fontSize: 13,
+      fontWeight: 600
+    }
+  }, "\uD83D\uDCE6 JSON \uBC31\uC5C5 \uB2E4\uC6B4\uB85C\uB4DC"), /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: clearAll,
+    style: {
+      flex: 1,
+      background: 'rgba(248,81,73,0.08)',
+      border: '1px solid #f85149',
+      borderRadius: 8,
+      padding: '10px',
+      color: '#f85149',
+      fontSize: 13,
+      fontWeight: 600
+    }
+  }, "\uD83D\uDDD1\uFE0F \uC804\uCCB4 \uB370\uC774\uD130 \uC0AD\uC81C"))));
+}
+
+/* ── mount ── */
+ReactDOM.createRoot(document.getElementById('root')).render(/*#__PURE__*/React.createElement(App, null));
+</script>
 </body>
 </html>
