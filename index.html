@@ -28,25 +28,34 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: #0d1117; min-height: 100vh; padding: 20px 16px; }
+    body { background: #0f1623; min-height: 100vh; padding: 20px 16px; }
     #root { max-width: 880px; margin: 0 auto; }
+    /* ── input / textarea / select global focus & placeholder ── */
+    input:focus, textarea:focus, select:focus {
+      outline: none !important;
+      border-color: rgba(251,191,36,0.65) !important;
+      box-shadow: 0 0 0 3px rgba(251,191,36,0.12) !important;
+    }
+    input::placeholder, textarea::placeholder { color: #4a5568; opacity:1; }
+    select option { background: #1d2843; color: #f1f5f9; }
     #confirm-overlay {
-      display:none; position:fixed; inset:0; background:rgba(0,0,0,.75);
+      display:none; position:fixed; inset:0; background:rgba(0,0,0,.8);
       z-index:9999; align-items:center; justify-content:center;
     }
     #confirm-overlay.open { display:flex; }
     #confirm-box {
-      background:#161b22; border:1px solid rgba(240,246,252,0.18);
-      border-radius:14px; padding:28px 24px; max-width:360px; width:90%;
+      background:#1d2435; border:1px solid rgba(148,163,184,0.22);
+      border-radius:16px; padding:30px 26px; max-width:360px; width:90%;
       font-family: ui-sans-serif, system-ui, sans-serif;
-      box-shadow: 0 16px 48px rgba(0,0,0,.5);
+      box-shadow: 0 20px 60px rgba(0,0,0,.6);
     }
-    #confirm-msg { color:#e6edf3; font-size:14.5px; line-height:1.65; margin-bottom:20px; }
+    #confirm-msg { color:#f1f5f9; font-size:15px; line-height:1.65; margin-bottom:22px; }
     #confirm-btns { display:flex; gap:10px; }
-    #confirm-btns button { flex:1; border-radius:9px; padding:11px; font-size:13.5px;
+    #confirm-btns button { flex:1; border-radius:10px; padding:12px; font-size:14px;
       font-weight:700; cursor:pointer; border:none; font-family:inherit; }
-    #confirm-ok  { background:#f0b429; color:#0d1117; }
-    #confirm-can { background:transparent; color:#8b949e; border:1px solid rgba(240,246,252,0.15) !important; }
+    #confirm-ok  { background:#fbbf24; color:#0f1623; }
+    #confirm-can { background:rgba(148,163,184,0.08); color:#94a3b8;
+      border:1px solid rgba(148,163,184,0.2) !important; }
   </style>
 </head>
 <body>
@@ -526,23 +535,23 @@ const SEED = [{
 
 /* ── theme ── */
 const C = {
-  bg:    '#0d1117',   // GitHub dark bg — proven long-read palette
-  panel: '#161b22',   // surface
-  panel2:'#1c2128',   // elevated surface
-  line:  'rgba(240,246,252,0.10)',
-  line2: 'rgba(240,246,252,0.18)',
-  text:  '#e6edf3',   // high contrast (7:1 ratio)
-  dim:   '#8b949e',   // secondary text
-  faint: '#6e7681',   // tertiary text
-  amber: '#f0b429',   // brighter amber — visible on dark
-  teal:  '#39c5cf',   // clinical teal
-  red:   '#f85149',   // GitHub red
-  green: '#3fb950',   // GitHub green
+  bg:    '#0f1623',   // deep navy — distinct from panels
+  panel: '#182031',   // card / surface — clearly lighter than bg
+  panel2:'#1e2a40',   // elevated / active state
+  line:  'rgba(148,163,184,0.16)',  // slate-400 @ 16% — visible border
+  line2: 'rgba(148,163,184,0.30)',  // stronger border
+  text:  '#f1f5f9',   // slate-100 — near white, sharp
+  dim:   '#94a3b8',   // slate-400 — much brighter secondary
+  faint: '#64748b',   // slate-500
+  amber: '#fbbf24',   // amber-400 — vivid
+  teal:  '#22d3ee',   // cyan-400 — vivid
+  red:   '#f87171',   // red-400
+  green: '#4ade80',   // green-400
 };
 const gcss = `
       @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Fraunces:opsz,wght@9..144,400;9..144,600&display=swap');
       .uwn{font-family:'Inter',ui-sans-serif,system-ui,-apple-system,sans-serif;font-size:15px;line-height:1.6;-webkit-font-smoothing:antialiased;}
-      .uwn ::selection{background:#f0b429;color:#0d1117;}
+      .uwn ::selection{background:#fbbf24;color:#0f1623;}
       .serif{font-family:'Fraunces',Georgia,serif;letter-spacing:-.01em;}
       .uwn button,.uwn input,.uwn textarea,.uwn select{font-family:inherit;}
       .uwn button{cursor:pointer;} .uwn textarea{resize:vertical;}
@@ -559,23 +568,24 @@ const gcss = `
     `;
 const field = {
   width: '100%',
-  background: C.panel,
+  background: '#0a0f1a',     // 인풋은 bg보다 어둡게 → panel 위에서 depth 확보
   color: C.text,
-  border: `1px solid ${C.line2}`,
-  borderRadius: 8,
-  padding: '10px 13px',
+  border: `1.5px solid ${C.line2}`,
+  borderRadius: 9,
+  padding: '11px 14px',
   fontSize: 14.5,
   outline: 'none',
   lineHeight: 1.55,
+  transition: 'border-color .15s, box-shadow .15s',
 };
 const lbl = {
-  fontSize: 11,
-  letterSpacing: '.06em',
+  fontSize: 11.5,
+  letterSpacing: '.07em',
   textTransform: 'uppercase',
-  color: C.dim,
-  marginBottom: 5,
+  color: '#94a3b8',
+  marginBottom: 7,
   display: 'block',
-  fontWeight: 600
+  fontWeight: 700,
 };
 
 /* ── micro-components ── */
