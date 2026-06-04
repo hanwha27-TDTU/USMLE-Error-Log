@@ -23,9 +23,9 @@
       FOR ALL USING (true) WITH CHECK (true);
     ─────────────────────────────────
   -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js" crossorigin="anonymous"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js" crossorigin="anonymous"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" crossorigin="anonymous"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -95,7 +95,13 @@
       catch { return null; }
     }
     function saveStore(cards) {
-      try { localStorage.setItem(STORE_KEY, JSON.stringify(cards)); } catch(e) {}
+      try {
+        localStorage.setItem(STORE_KEY, JSON.stringify(cards));
+      } catch(e) {
+        // 용량 초과 또는 저장 불가 — 사용자에게 즉시 알림
+        console.error('localStorage save failed:', e);
+        showGlobalToast('⚠️ 저장 실패: 브라우저 저장공간 부족 또는 개인정보 보호 모드');
+      }
     }
 
     /* ── Migrate from IndexedDB (one-time, v1 users) ── */
@@ -165,19 +171,34 @@
     }
     async function sbPushAll(cards) {
       const cfg = getSbCfg(); if (!cfg) return 0;
-      /* 1. delete all */
-      await fetch(`${cfg.url}/rest/v1/usmle_cards?id=not.is.null`, {
-        method: 'DELETE', headers: sbHdrs({ 'Prefer': 'return=minimal' })
-      });
-      if (cards.length === 0) return 0;
-      /* 2. insert all */
-      const rows = cards.map(c => ({ id: c.id, data: JSON.stringify(c) }));
-      const res = await fetch(`${cfg.url}/rest/v1/usmle_cards`, {
-        method: 'POST',
-        headers: sbHdrs({ 'Prefer': 'return=minimal' }),
-        body: JSON.stringify(rows)
-      });
-      if (!res.ok) throw new Error(`Push failed: ${res.status}`);
+      /* 원자성 보장 전략:
+         ① 로컬 카드 전체 upsert (실패 시 throw → 클라우드 데이터 보존)
+         ② 클라우드에만 남은 고아 카드 삭제 (실패해도 데이터 유실 없음)
+         → 삭제-먼저 방식에서 데이터 유실 가능성 제거 */
+
+      // ① upsert (insert or update) — 실패 시 기존 클라우드 데이터 완전 보존
+      if (cards.length > 0) {
+        const rows = cards.map(c => ({ id: c.id, data: JSON.stringify(c) }));
+        const res = await fetch(`${cfg.url}/rest/v1/usmle_cards`, {
+          method: 'POST',
+          headers: sbHdrs({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+          body: JSON.stringify(rows)
+        });
+        if (!res.ok) throw new Error(`Upsert 실패: ${res.status} — 클라우드 데이터 보존됨`);
+      }
+
+      // ② 고아 삭제 — 실패해도 throw 안 함 (데이터 손실 아님, 불일치만)
+      if (cards.length > 0) {
+        const ids = cards.map(c => c.id).join(',');
+        await fetch(`${cfg.url}/rest/v1/usmle_cards?id=not.in.(${ids})`, {
+          method: 'DELETE', headers: sbHdrs({ 'Prefer': 'return=minimal' })
+        }).catch(e => console.warn('고아 카드 삭제 실패 (무시):', e.message));
+      } else {
+        // 로컬이 완전히 비었으면 클라우드도 전체 삭제
+        await fetch(`${cfg.url}/rest/v1/usmle_cards?id=not.is.null`, {
+          method: 'DELETE', headers: sbHdrs({ 'Prefer': 'return=minimal' })
+        }).catch(e => console.warn('전체 삭제 실패:', e.message));
+      }
       return cards.length;
     }
     async function sbTest() {
@@ -309,7 +330,6 @@ Generate concise USMLE-style content. Respond ONLY with valid JSON (no markdown,
   "pathophys": "1-2 line mechanism using up/down arrows (↑↓)",
   "trap": "why a student would pick the wrong answer instead of correct one",
   "content_kr": "한국어 기반 1-2문장 설명. 의학용어는 반드시 '한국어(English)' 병기 형식으로. 예: 신세관(Proximal Tubule) 손상 → 갈색 과립 원주(Muddy Brown Casts) 형성",
-  "content_uz": "1-2 sentence Uzbek explanation (asosiy nuqta)",
   "content_en": "1-2 sentence English high-yield note",
   "buzzword": "comma-separated 2-4 USMLE buzzwords"
 }`;
@@ -321,6 +341,13 @@ Generate concise USMLE-style content. Respond ONLY with valid JSON (no markdown,
     }
 
     /* ── Export helpers ── */
+    /* Anki TSV cell — 탭·실제 줄바꿈 제거 (열 깨짐 방지) */
+    function cleanTsvCell(v) {
+      return String(v || '')
+        .replace(new RegExp('\t', 'g'), '  ')
+        .replace(new RegExp('\r?\n', 'g'), ' ');
+    }
+
     function exportJSON(cards) {
       const json = JSON.stringify({ version: 2, exported: new Date().toISOString(), count: cards.length, cards }, null, 2);
       _download(new Blob([json], { type: 'application/json' }), 'usmle_backup.json');
@@ -332,7 +359,7 @@ Generate concise USMLE-style content. Respond ONLY with valid JSON (no markdown,
         'Pathophys': c.pathophys, 'Trap': c.trap,
         'Buzzword': (c.buzzword || []).join(', '),
         'Source': c.source, 'Confidence': c.confidence,
-        'KR': c.content_kr, 'UZ': c.content_uz, 'EN': c.content_en,
+        'KR': c.content_kr, 'EN': c.content_en,
         'SRS Interval': c.srs?.interval || 0, 'Due Date': c.srs?.dueDate || '',
       }));
       const ws = XLSX.utils.json_to_sheet(rows);
@@ -451,10 +478,15 @@ function schedule(srs, pass) {
     interval,
     ease: +ease.toFixed(2),
     reps,
-    dueDate: d.toISOString().slice(0, 10)
+    dueDate: `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`
   };
 }
-const todayStr = () => new Date().toISOString().slice(0, 10);
+const todayStr = () => {
+  const d = new Date();
+  // toISOString()은 UTC 기준 → 한국(UTC+9)에서 자정 근처 하루 밀림
+  // getFullYear/Month/Date는 로컬 타임존 기준
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+};
 const isDue = c => !c.srs || !c.srs.dueDate || c.srs.dueDate <= todayStr();
 const uid = () => Math.random().toString(36).slice(2, 10);
 function interleave(cards) {
@@ -497,7 +529,6 @@ const SEED = [{
   source: 'UWorld',
   confidence: 4,
   content_kr: '바터 증후군(Bartter Syndrome) = 헨레고리(Loop of Henle) NKCC2 결함. 고칼슘뇨(Hypercalciuria)가 핵심 감별점.',
-  content_uz: 'Bartter = NKCC2 nuqson. Giperkalsiuriya — asosiy farq.',
   content_en: 'Bartter = NKCC2 defect (loop-diuretic mimic). Hypercalciuria distinguishes from Gitelman.',
   originalMcq: {
     stemFull: 'A 9-year-old has muscle weakness. Labs: K⁺ 2.8, metabolic alkalosis, normal BP, ↑ urine Ca²⁺. The defect is in which transporter?',
@@ -518,7 +549,6 @@ const SEED = [{
   source: 'NBME',
   confidence: 3,
   content_kr: '급성호흡곤란증후군(ARDS) = 비심인성 폐부종(Non-cardiogenic Pulmonary Edema). 폐보호 환기(Lung-protective Ventilation, 6 mL/kg) + 호기말양압(PEEP). P/F비 < 300.',
-  content_uz: 'ARDS = nokardiogen. Past hajmli ventilyatsiya (6 mL/kg) + PEEP. P/F<300.',
   content_en: 'ARDS = noncardiogenic. Lung-protective ventilation (6 mL/kg) + PEEP. P/F<300.',
   originalMcq: null,
   srs: null
@@ -535,7 +565,6 @@ const SEED = [{
   source: 'UWorld',
   confidence: 2,
   content_kr: '급성세관괴사(Acute Tubular Necrosis, ATN) = 세관(Tubule) 괴사. 갈색 과립 원주(Muddy Brown Casts), 소변 나트륨 분획 배설(FENa) > 2%. 지지요법.',
-  content_uz: 'ATN = kanalcha nekrozi. FENa>2%, jigarrang granular silindrlar. Qo\'llab-quvvatlovchi davo.',
   content_en: 'ATN = tubular necrosis. FENa>2%, muddy-brown casts. Supportive care.',
   originalMcq: null,
   srs: null
@@ -925,7 +954,6 @@ const emptyDraft = () => ({
   source: '',
   confidence: 3,
   content_kr: '',
-  content_uz: '',
   content_en: '',
   hasMcq: false,
   mcqStem: '',
@@ -956,7 +984,6 @@ function Capture({
         pathophys: r.pathophys || p.pathophys,
         trap: r.trap || p.trap,
         content_kr: r.content_kr || p.content_kr,
-        content_uz: r.content_uz || p.content_uz,
         content_en: r.content_en || p.content_en,
         buzzword: r.buzzword || p.buzzword
       }));
@@ -985,8 +1012,7 @@ function Capture({
       source: d.source.trim(),
       confidence: d.confidence,
       content_kr: d.content_kr.trim(),
-      content_uz: d.content_uz.trim(),
-      content_en: d.content_en.trim(),
+          content_en: d.content_en.trim(),
       originalMcq: d.hasMcq ? {
         stemFull: d.mcqStem.trim(),
         options: d.mcqOptions.map(o => o.trim()).filter(Boolean),
@@ -1142,7 +1168,7 @@ function Capture({
     }
   }, /*#__PURE__*/React.createElement("label", {
     style: lbl
-  }, "\uD2B8\uB9B4\uB9C1\uAD6C\uC5BC \uD574\uC124 (KR / UZ / EN)"), /*#__PURE__*/React.createElement("div", {
+  }, "\uD2B8\uB9B4\uB9C1\uAD6C\uC5BC \uD574\uC124 (KR / EN)"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'grid',
       gap: 8
@@ -1152,11 +1178,6 @@ function Capture({
     value: d.content_kr,
     onChange: e => set('content_kr', e.target.value),
     placeholder: "\uD83C\uDDF0\uD83C\uDDF7 \uD55C\uAD6D\uC5B4 \uD574\uC124"
-  }), /*#__PURE__*/React.createElement("input", {
-    style: field,
-    value: d.content_uz,
-    onChange: e => set('content_uz', e.target.value),
-    placeholder: "\uD83C\uDDFA\uD83C\uDDFF O'zbekcha izoh"
   }), /*#__PURE__*/React.createElement("input", {
     style: field,
     value: d.content_en,
@@ -1535,7 +1556,7 @@ function Recall({
   }, card.buzzword.map((b, k) => /*#__PURE__*/React.createElement(Badge, {
     key: k,
     color: C.teal
-  }, b))), (card.content_kr || card.content_uz || card.content_en) && /*#__PURE__*/React.createElement("div", {
+  }, b))), (card.content_kr || card.content_en) && /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 12,
       borderTop: `1px solid ${C.line}`,
@@ -1548,11 +1569,7 @@ function Recall({
     style: {
       color: C.faint
     }
-  }, "\uD83C\uDDF0\uD83C\uDDF7 "), card.content_kr), card.content_uz && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
-    style: {
-      color: C.faint
-    }
-  }, "\uD83C\uDDFA\uD83C\uDDFF "), card.content_uz), card.content_en && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
+  }, "\uD83C\uDDF0\uD83C\uDDF7 "), card.content_kr), card.content_en && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
     style: {
       color: C.faint
     }
@@ -1657,7 +1674,6 @@ function Library({
       source: card.source || '',
       confidence: card.confidence || 3,
       content_kr: card.content_kr || '',
-      content_uz: card.content_uz || '',
       content_en: card.content_en || '',
       hasMcq: !!card.originalMcq,
       mcqStem: card.originalMcq?.stemFull || '',
@@ -1680,7 +1696,6 @@ function Library({
         pathophys: r.pathophys || p.pathophys,
         trap: r.trap || p.trap,
         content_kr: r.content_kr || p.content_kr,
-        content_uz: r.content_uz || p.content_uz,
         content_en: r.content_en || p.content_en,
         buzzword: r.buzzword || p.buzzword
       }));
@@ -1707,8 +1722,7 @@ function Library({
       source: d.source.trim(),
       confidence: d.confidence,
       content_kr: d.content_kr.trim(),
-      content_uz: d.content_uz.trim(),
-      content_en: d.content_en.trim(),
+          content_en: d.content_en.trim(),
       originalMcq: d.hasMcq ? {
         stemFull: d.mcqStem.trim(),
         options: d.mcqOptions.map(o => o.trim()).filter(Boolean),
@@ -2005,7 +2019,7 @@ function Library({
     }, c.buzzword.map((b, i) => /*#__PURE__*/React.createElement(Badge, {
       key: i,
       color: C.teal
-    }, b))), (c.content_kr || c.content_uz || c.content_en) && /*#__PURE__*/React.createElement("div", {
+    }, b))), (c.content_kr || c.content_en) && /*#__PURE__*/React.createElement("div", {
       style: {
         borderTop: `1px solid ${C.line}`,
         paddingTop: 8,
@@ -2018,11 +2032,7 @@ function Library({
       style: {
         color: C.faint
       }
-    }, "\uD83C\uDDF0\uD83C\uDDF7 "), c.content_kr), c.content_uz && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
-      style: {
-        color: C.faint
-      }
-    }, "\uD83C\uDDFA\uD83C\uDDFF "), c.content_uz), c.content_en && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
+    }, "\uD83C\uDDF0\uD83C\uDDF7 "), c.content_kr), c.content_en && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
       style: {
         color: C.faint
       }
@@ -2201,11 +2211,6 @@ function Library({
       value: editDraft.content_kr,
       onChange: e => setED('content_kr', e.target.value),
       placeholder: "\uD83C\uDDF0\uD83C\uDDF7 \uD55C\uAD6D\uC5B4"
-    }), /*#__PURE__*/React.createElement("input", {
-      style: field,
-      value: editDraft.content_uz,
-      onChange: e => setED('content_uz', e.target.value),
-      placeholder: "\uD83C\uDDFA\uD83C\uDDFF O'zbekcha"
     }), /*#__PURE__*/React.createElement("input", {
       style: field,
       value: editDraft.content_en,
@@ -2420,8 +2425,9 @@ function Export({
   const [copied, setCopied] = useState(false);
   const [importMode, setImportMode] = useState(false);
   const tsv = useMemo(() => cards.map(c => {
-    const back = [c.correct, c.pathophys && `Pathophys: ${c.pathophys}`, c.trap && `Trap: ${c.trap}`, c.buzzword?.length && `Buzz: ${c.buzzword.join(', ')}`, c.content_kr && `[KR] ${c.content_kr}`, c.content_uz && `[UZ] ${c.content_uz}`, c.content_en && `[EN] ${c.content_en}`].filter(Boolean).join('\\n');
-    return `${c.stem}\t${back}`;
+    const _ct=v=>String(v||'').replace(/\t/g,'  ').replace(/\r?\n/g,' ');
+    const back=[_ct(c.correct),c.pathophys&&`Pathophys: ${_ct(c.pathophys)}`,c.trap&&`Trap: ${_ct(c.trap)}`,c.buzzword?.length&&`Buzz: ${_ct(c.buzzword.join(', '))}`,c.content_kr&&`[KR] ${_ct(c.content_kr)}`,c.content_en&&`[EN] ${_ct(c.content_en)}`].filter(Boolean).join('\\n');
+    return `${_ct(c.stem)}	${back}`;
   }).join('\n'), [cards]);
   const copy = async () => {
     try {
@@ -2525,7 +2531,7 @@ function Export({
       padding: '1px 5px',
       borderRadius: 4
     }
-  }, '\\n'), " \xB7 [KR][UZ][EN] \uD3EC\uD568")), /*#__PURE__*/React.createElement("div", {
+  }, '\\n'), " \xB7 [KR][EN] \uD3EC\uD568")), /*#__PURE__*/React.createElement("div", {
     style: {
       borderTop: `1px solid ${C.line}`,
       paddingTop: 14
@@ -2553,10 +2559,19 @@ function Export({
       reader.onload = ev => {
         try {
           const d = JSON.parse(ev.target.result);
-          const imported = d.cards || d;
-          if (!Array.isArray(imported)) throw new Error('cards 배열 없음');
-          showConfirm(`JSON에서 ${imported.length}개 카드를 가져올까요?<br><span style="font-size:11px;color:#9a9088">기존 카드와 병합됩니다 (중복 ID는 덮어씁니다)</span>`, () => {
-            const existingIds = new Set(cards.map(c => c.id));
+          const raw = d.cards || d;
+          if (!Array.isArray(raw)) throw new Error('cards 배열 없음');
+          // 카드 구조 검증 — 필수 필드 없으면 skip
+          const imported = raw.filter(c =>
+            c && typeof c === 'object' &&
+            typeof c.id === 'string' && c.id.length > 0 &&
+            typeof c.stem === 'string' &&
+            typeof c.correct === 'string'
+          );
+          if (imported.length === 0) throw new Error('유효한 카드 데이터가 없습니다 (id·stem·correct 필드 필요)');
+          const skipped = raw.length - imported.length;
+          const skipMsg = skipped > 0 ? `<br><span style="color:#f97316;font-size:11px">⚠️ 구조 불일치 ${skipped}개 건너뜀</span>` : '';
+          showConfirm(`JSON에서 ${imported.length}개 카드를 가져올까요?${skipMsg}<br><span style="font-size:11px;color:#64748b">기존 카드와 병합됩니다 (중복 ID는 덮어씁니다)</span>`, () => {
             const merged = [...imported, ...cards.filter(c => !imported.find(i => i.id === c.id))];
             saveStore(merged);
             window.location.reload();
