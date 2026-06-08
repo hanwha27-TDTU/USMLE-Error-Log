@@ -3,10 +3,10 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>USMLE 오답 인출 노트</title>
+  <title>Dr. Bugeon의 USMLE 오답노트</title>
   <!--
-    USMLE 오답 인출 노트 — v2
-    · Supabase 클라우드 동기화 (자동 + 수동 push/pull)
+    Dr. Bugeon의 USMLE 오답노트 — v3
+    · Supabase 클라우드 동기화 (updated_at 병합 + 최종본 버전)
     · AI 자동완성 (Claude 내장 / OpenAI / Anthropic / Gemini)
     · localStorage + IndexedDB 마이그레이션
     · JSON 백업 export/import  ·  Excel export
@@ -14,13 +14,22 @@
 
     Supabase 테이블 설정 (최초 1회):
     ─────────────────────────────────
-    CREATE TABLE usmle_cards (
+    CREATE TABLE IF NOT EXISTS usmle_cards (
       id   text PRIMARY KEY,
       data text NOT NULL
     );
+    ALTER TABLE usmle_cards ADD COLUMN IF NOT EXISTS created_at timestamptz DEFAULT now();
+    ALTER TABLE usmle_cards ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now();
+    ALTER TABLE usmle_cards ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
     ALTER TABLE usmle_cards ENABLE ROW LEVEL SECURITY;
     CREATE POLICY "allow_all" ON usmle_cards
       FOR ALL USING (true) WITH CHECK (true);
+
+    CREATE TABLE IF NOT EXISTS language_sync_meta (
+      key text primary key,
+      value text,
+      updated_at timestamptz default now()
+    );
     ─────────────────────────────────
   -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js" crossorigin="anonymous"></script>
@@ -88,6 +97,106 @@
     const STORE_KEY  = 'usmle_cards_v1';
     const SB_CFG_KEY = 'usmle_supa_cfg';
     const AI_CFG_KEY = 'usmle_ai_cfg';
+    const SYNC_META_KEY = 'usmle_sync_meta_v1';
+    const TOMBSTONE_KEY = 'usmle_deleted_tombstones_v1';
+    const CARD_TABLE = 'usmle_cards';
+    const SYNC_META_TABLE = 'language_sync_meta';
+
+    const nowIso = () => new Date().toISOString();
+    const canonicalStamp = () => `${nowIso()}-${Math.random().toString(36).slice(2, 10)}`;
+    const toMs = v => {
+      const ms = Date.parse(v || '');
+      return Number.isFinite(ms) ? ms : 0;
+    };
+    function ensureCardMeta(card, fallbackIso = nowIso()) {
+      const created = card.created_at || card.createdAt || card.updated_at || card.updatedAt || fallbackIso;
+      const updated = card.updated_at || card.updatedAt || created || fallbackIso;
+      const deleted = card.deleted_at || card.deletedAt || null;
+      const clean = {
+        ...card,
+        id: String(card.id || '').trim(),
+        created_at: created,
+        updated_at: updated
+      };
+      delete clean.createdAt;
+      delete clean.updatedAt;
+      delete clean.deletedAt;
+      if (deleted) clean.deleted_at = deleted; else delete clean.deleted_at;
+      return clean;
+    }
+    function touchCard(card, changes = {}) {
+      const base = ensureCardMeta(card);
+      const stamp = nowIso();
+      return {
+        ...base,
+        ...changes,
+        created_at: base.created_at || stamp,
+        updated_at: stamp
+      };
+    }
+    function normalizeCards(cards, { includeDeleted = false } = {}) {
+      const byId = new Map();
+      (Array.isArray(cards) ? cards : []).forEach(card => {
+        if (!card || typeof card !== 'object' || !card.id) return;
+        const clean = ensureCardMeta(card);
+        const prev = byId.get(clean.id);
+        if (!prev || toMs(clean.updated_at) >= toMs(prev.updated_at)) byId.set(clean.id, clean);
+      });
+      return Array.from(byId.values())
+        .filter(card => includeDeleted || !card.deleted_at)
+        .sort((a, b) => toMs(b.updated_at) - toMs(a.updated_at));
+    }
+    function mergeByUpdatedAt(localCards, cloudCards, { includeDeleted = false } = {}) {
+      const merged = new Map();
+      [...normalizeCards(localCards, { includeDeleted: true }), ...normalizeCards(cloudCards, { includeDeleted: true })]
+        .forEach(card => {
+          const prev = merged.get(card.id);
+          if (!prev || toMs(card.updated_at) >= toMs(prev.updated_at)) merged.set(card.id, card);
+        });
+      return normalizeCards(Array.from(merged.values()), { includeDeleted });
+    }
+    function makeTombstone(id, existing = null) {
+      const stamp = nowIso();
+      const base = existing ? ensureCardMeta(existing) : { id, created_at: stamp };
+      return {
+        ...base,
+        id,
+        created_at: base.created_at || stamp,
+        updated_at: stamp,
+        deleted_at: stamp
+      };
+    }
+    function getLocalSyncMeta() {
+      try { return JSON.parse(localStorage.getItem(SYNC_META_KEY)) || {}; } catch { return {}; }
+    }
+    function saveLocalSyncMeta(meta) {
+      localStorage.setItem(SYNC_META_KEY, JSON.stringify({
+        ...getLocalSyncMeta(),
+        ...meta,
+        checked_at: nowIso()
+      }));
+    }
+    function loadLocalTombstones() {
+      try {
+        const raw = JSON.parse(localStorage.getItem(TOMBSTONE_KEY)) || [];
+        return normalizeCards(raw, { includeDeleted: true }).filter(card => card.deleted_at);
+      } catch { return []; }
+    }
+    function saveLocalTombstones(tombstones) {
+      const clean = normalizeCards(tombstones, { includeDeleted: true }).filter(card => card.deleted_at);
+      localStorage.setItem(TOMBSTONE_KEY, JSON.stringify(clean));
+      return clean;
+    }
+    function addLocalTombstone(id, existing = null) {
+      const tombstone = makeTombstone(id, existing);
+      saveLocalTombstones([...loadLocalTombstones().filter(card => card.id !== id), tombstone]);
+      return tombstone;
+    }
+    function addLocalTombstones(cards) {
+      const tombstones = (Array.isArray(cards) ? cards : []).map(card => makeTombstone(card.id, card));
+      saveLocalTombstones([...loadLocalTombstones(), ...tombstones]);
+      return tombstones;
+    }
 
     /* ── localStorage helpers ── */
     function loadStore() {
@@ -95,13 +204,15 @@
       catch { return null; }
     }
     function saveStore(cards) {
+      const clean = normalizeCards(cards);
       try {
-        localStorage.setItem(STORE_KEY, JSON.stringify(cards));
+        localStorage.setItem(STORE_KEY, JSON.stringify(clean));
       } catch(e) {
         // 용량 초과 또는 저장 불가 — 사용자에게 즉시 알림
         console.error('localStorage save failed:', e);
         showGlobalToast('⚠️ 저장 실패: 브라우저 저장공간 부족 또는 개인정보 보호 모드');
       }
+      return clean;
     }
 
     /* ── Migrate from IndexedDB (one-time, v1 users) ── */
@@ -145,70 +256,123 @@
         ...extra
       };
     }
-    async function sbUpsert(card) {
-      const cfg = getSbCfg(); if (!cfg) return;
-      await fetch(`${cfg.url}/rest/v1/usmle_cards`, {
+    function cardToRow(card) {
+      const clean = ensureCardMeta(card);
+      return {
+        id: clean.id,
+        created_at: clean.created_at,
+        updated_at: clean.updated_at,
+        deleted_at: clean.deleted_at || null,
+        data: JSON.stringify(clean)
+      };
+    }
+    async function sbUpsertRows(rows) {
+      const cfg = getSbCfg(); if (!cfg || rows.length === 0) return 0;
+      const res = await fetch(`${cfg.url}/rest/v1/${CARD_TABLE}`, {
         method: 'POST',
         headers: sbHdrs({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
-        body: JSON.stringify({ id: card.id, data: JSON.stringify(card) })
+        body: JSON.stringify(rows)
       });
+      if (!res.ok) throw new Error(`Upsert 실패: ${res.status} — ${await res.text()}`);
+      return rows.length;
+    }
+    async function sbGetMeta(key) {
+      const cfg = getSbCfg(); if (!cfg) return null;
+      const res = await fetch(
+        `${cfg.url}/rest/v1/${SYNC_META_TABLE}?select=value,updated_at&key=eq.${encodeURIComponent(key)}&limit=1`,
+        { headers: sbHdrs() }
+      );
+      if (!res.ok) throw new Error(`메타 테이블 확인 실패: ${res.status} — ${await res.text()}`);
+      const rows = await res.json();
+      return rows[0]?.value || null;
+    }
+    async function sbSetMeta(key, value) {
+      const cfg = getSbCfg(); if (!cfg) return value;
+      const res = await fetch(`${cfg.url}/rest/v1/${SYNC_META_TABLE}`, {
+        method: 'POST',
+        headers: sbHdrs({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+        body: JSON.stringify({ key, value, updated_at: nowIso() })
+      });
+      if (!res.ok) throw new Error(`메타 저장 실패: ${res.status} — ${await res.text()}`);
+      return value;
+    }
+    async function sbUpsert(card) {
+      const cfg = getSbCfg(); if (!cfg) return;
+      await sbUpsertRows([cardToRow(card)]);
     }
     async function sbDelete(id) {
       const cfg = getSbCfg(); if (!cfg) return;
-      await fetch(`${cfg.url}/rest/v1/usmle_cards?id=eq.${encodeURIComponent(id)}`, {
-        method: 'DELETE', headers: sbHdrs({ 'Prefer': 'return=minimal' })
-      });
+      const tombstone = addLocalTombstone(id);
+      await sbUpsertRows([cardToRow(tombstone)]);
     }
-    async function sbLoadAll() {
+    async function sbLoadAll({ includeDeleted = false } = {}) {
       const cfg = getSbCfg(); if (!cfg) return null;
       const res = await fetch(
-        `${cfg.url}/rest/v1/usmle_cards?select=data&order=id.asc&limit=5000`,
+        `${cfg.url}/rest/v1/${CARD_TABLE}?select=id,created_at,updated_at,deleted_at,data&order=updated_at.desc&limit=5000`,
         { headers: sbHdrs() }
       );
       if (!res.ok) throw new Error(`Supabase ${res.status}: ${await res.text()}`);
       const rows = await res.json();
-      return rows.map(r => JSON.parse(r.data));
+      return normalizeCards(rows.map(row => {
+        let data = {};
+        try { data = row.data ? JSON.parse(row.data) : {}; } catch { data = {}; }
+        return {
+          ...data,
+          id: row.id || data.id,
+          created_at: row.created_at || data.created_at,
+          updated_at: row.updated_at || data.updated_at,
+          deleted_at: row.deleted_at || data.deleted_at || null
+        };
+      }), { includeDeleted });
     }
-    async function sbPushAll(cards) {
+    async function sbPushAll(cards, { canonical = false } = {}) {
       const cfg = getSbCfg(); if (!cfg) return 0;
-      /* 원자성 보장 전략:
-         ① 로컬 카드 전체 upsert (실패 시 throw → 클라우드 데이터 보존)
-         ② 클라우드에만 남은 고아 카드 삭제 (실패해도 데이터 유실 없음)
-         → 삭제-먼저 방식에서 데이터 유실 가능성 제거 */
-
-      // ① upsert (insert or update) — 실패 시 기존 클라우드 데이터 완전 보존
-      if (cards.length > 0) {
-        const rows = cards.map(c => ({ id: c.id, data: JSON.stringify(c) }));
-        const res = await fetch(`${cfg.url}/rest/v1/usmle_cards`, {
-          method: 'POST',
-          headers: sbHdrs({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
-          body: JSON.stringify(rows)
-        });
-        if (!res.ok) throw new Error(`Upsert 실패: ${res.status} — 클라우드 데이터 보존됨`);
+      const clean = normalizeCards(cards);
+      await sbUpsertRows(clean.map(cardToRow));
+      if (canonical) {
+        const keep = new Set(clean.map(card => card.id));
+        const cloudAll = await sbLoadAll({ includeDeleted: true }) || [];
+        const tombstones = cloudAll
+          .filter(card => !card.deleted_at && !keep.has(card.id))
+          .map(card => cardToRow(makeTombstone(card.id, card)));
+        await sbUpsertRows(tombstones);
+        saveLocalTombstones(tombstones.map(row => JSON.parse(row.data)));
+        const version = await sbSetMeta('canonical_version', canonicalStamp());
+        saveLocalSyncMeta({ canonical_version: version, last_sync_mode: 'canonical_push' });
       }
-
-      // ② 고아 삭제 — 실패해도 throw 안 함 (데이터 손실 아님, 불일치만)
-      if (cards.length > 0) {
-        const ids = cards.map(c => c.id).join(',');
-        await fetch(`${cfg.url}/rest/v1/usmle_cards?id=not.in.(${ids})`, {
-          method: 'DELETE', headers: sbHdrs({ 'Prefer': 'return=minimal' })
-        }).catch(e => console.warn('고아 카드 삭제 실패 (무시):', e.message));
-      } else {
-        // 로컬이 완전히 비었으면 클라우드도 전체 삭제
-        await fetch(`${cfg.url}/rest/v1/usmle_cards?id=not.is.null`, {
-          method: 'DELETE', headers: sbHdrs({ 'Prefer': 'return=minimal' })
-        }).catch(e => console.warn('전체 삭제 실패:', e.message));
-      }
-      return cards.length;
+      return clean.length;
     }
     async function sbTest() {
       const cfg = getSbCfg(); if (!cfg) throw new Error('미설정');
       const res = await fetch(
-        `${cfg.url}/rest/v1/usmle_cards?select=id&limit=1`,
+        `${cfg.url}/rest/v1/${CARD_TABLE}?select=id&limit=1`,
         { headers: sbHdrs() }
       );
       if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+      const meta = await fetch(
+        `${cfg.url}/rest/v1/${SYNC_META_TABLE}?select=key&limit=1`,
+        { headers: sbHdrs() }
+      );
+      if (!meta.ok) throw new Error(`language_sync_meta 필요: ${meta.status}: ${await meta.text()}`);
       return true;
+    }
+    async function sbAutoSync(localCards) {
+      const cloudVersion = await sbGetMeta('canonical_version');
+      const localMeta = getLocalSyncMeta();
+      const cloudCards = await sbLoadAll({ includeDeleted: true }) || [];
+      if (cloudVersion && cloudVersion !== localMeta.canonical_version) {
+        const cloudVisible = normalizeCards(cloudCards);
+        saveLocalTombstones(cloudCards.filter(card => card.deleted_at));
+        saveLocalSyncMeta({ canonical_version: cloudVersion, last_sync_mode: 'canonical_pull' });
+        return { cards: cloudVisible, mode: 'canonical_pull', count: cloudVisible.length };
+      }
+      const localAll = normalizeCards([...localCards, ...loadLocalTombstones()], { includeDeleted: true });
+      const mergedAll = mergeByUpdatedAt(localAll, cloudCards, { includeDeleted: true });
+      const mergedVisible = normalizeCards(mergedAll);
+      await sbUpsertRows(mergedAll.map(cardToRow));
+      saveLocalTombstones(mergedAll.filter(card => card.deleted_at));
+      if (cloudVersion) saveLocalSyncMeta({ canonical_version: cloudVersion, last_sync_mode: 'merge' });
+      return { cards: mergedVisible, mode: 'merge', count: mergedVisible.length };
     }
     function cloudSave(card) {
       if (!getSbCfg()) return;
@@ -727,24 +891,28 @@ function App() {
         let data = loadStore();
         /* 2. fallback: try migrate from IndexedDB with timeout */
         if (!data) data = await migrateFromIDB();
-        if (data && Array.isArray(data) && data.length > 0) {
-          setCards(data);
-          if (!loadStore()) saveStore(data);
+        if (Array.isArray(data)) {
+          const clean = normalizeCards(data);
+          setCards(clean);
+          saveStore(clean);
         } else {
-          setCards(SEED);
-          saveStore(SEED);
+          const seed = normalizeCards(SEED);
+          setCards(seed);
+          saveStore(seed);
         }
       } catch(e) {
         /* 어떤 오류가 발생해도 SEED로 fallback — 절대 멈추지 않음 */
         console.error('App init error:', e);
-        setCards(SEED);
-        saveStore(SEED);
+        const seed = normalizeCards(SEED);
+        setCards(seed);
+        saveStore(seed);
       }
     })();
   }, []);
   const update = useCallback((next, deletedId = null) => {
-    setCards(next);
-    saveStore(next);
+    const clean = normalizeCards(next);
+    setCards(clean);
+    saveStore(clean);
     if (deletedId) cloudDel(deletedId);
   }, []);
   const flash = m => {
@@ -813,9 +981,9 @@ function App() {
     style: {
       fontSize: 23,
       fontWeight: 600,
-      letterSpacing: '-.01em'
+      letterSpacing: '0'
     }
-  }, "\uC624\uB2F5 \uC778\uCD9C \uB178\uD2B8 ", /*#__PURE__*/React.createElement("span", {
+  }, "Dr. Bugeon\uC758 USMLE \uC624\uB2F5\uB178\uD2B8 ", /*#__PURE__*/React.createElement("span", {
     style: {
       color: C.amber
     }
@@ -825,7 +993,7 @@ function App() {
       fontWeight: 400,
       fontSize: 15
     }
-  }, "Retrieval Notebook")), /*#__PURE__*/React.createElement("div", {
+  }, "USMLE Wrong-Answer Notebook")), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 12,
       color: C.faint,
@@ -999,7 +1167,7 @@ function Capture({
       flash('stem · 정답 · 오답유형은 필수');
       return;
     }
-    const card = {
+    const card = touchCard({
       id: uid(),
       stem: d.stem.trim(),
       myAnswer: d.myAnswer.trim(),
@@ -1019,7 +1187,7 @@ function Capture({
         answerIndex: d.mcqAnswerIndex
       } : null,
       srs: null
-    };
+    });
     update([card, ...cards]);
     cloudSave(card);
     setD(emptyDraft());
@@ -1360,10 +1528,9 @@ function Recall({
     setPicked(null);
   }, [i]);
   const grade = pass => {
-    const updated = {
-      ...card,
+    const updated = touchCard(card, {
       srs: schedule(card.srs, pass)
-    };
+    });
     const next = cards.map(c => c.id === card.id ? updated : c);
     update(next);
     cloudSave(updated);
@@ -1709,8 +1876,7 @@ function Library({
   const saveEdit = id => {
     const d = editDraft;
     if (!d.stem.trim() || !d.correct.trim() || !d.errorType) return;
-    const updated = cards.map(c => c.id !== id ? c : {
-      ...c,
+    const updated = cards.map(c => c.id !== id ? c : touchCard(c, {
       stem: d.stem.trim(),
       myAnswer: d.myAnswer.trim(),
       correct: d.correct.trim(),
@@ -1728,7 +1894,7 @@ function Library({
         options: d.mcqOptions.map(o => o.trim()).filter(Boolean),
         answerIndex: d.mcqAnswerIndex
       } : null
-    });
+    }));
     update(updated);
     cloudSave(updated.find(c => c.id === id));
     setEditing(null);
@@ -2659,27 +2825,34 @@ function Settings({
     setSbLoading(true);
     try {
       await sbTest();
-      setSbStatus('✅ 연결 성공');
-      flash('Supabase 연결 성공!');
+      const synced = await sbAutoSync(cards);
+      update(synced.cards);
+      const isCanonical = synced.mode === 'canonical_pull';
+      setSbStatus(isCanonical ? '✅ 연결 성공 · 클라우드 최종본 반영' : '✅ 연결 성공 · 자동 동기화 완료');
+      flash(isCanonical ? `클라우드 최종본 ${synced.count}개 반영` : `자동 동기화 완료 · ${synced.count}개`);
     } catch (e) {
       setSbStatus('❌ 연결 실패: ' + e.message);
       flash('연결 실패: ' + e.message);
     }
     setSbLoading(false);
   };
-  const pushToCloud = async () => {
+  const pushToCloud = () => {
     if (!getSbCfg()) {
       flash('먼저 Supabase 설정을 저장하세요');
       return;
     }
-    setSbLoading(true);
-    try {
-      const n = await sbPushAll(cards);
-      flash(`⬆️ ${n}개 카드를 클라우드로 전송 완료`);
-    } catch (e) {
-      flash('Push 실패: ' + e.message);
-    }
-    setSbLoading(false);
+    showConfirm(`이 기기의 ${cards.length}개 카드를 최종본으로 지정할까요?<br><span style="font-size:11px;color:#f97316">다른 기기는 다음 동기화 때 로컬 전용 항목을 보존하지 않고 클라우드 기준으로 맞춥니다.</span>`, async () => {
+      setSbLoading(true);
+      try {
+        const n = await sbPushAll(cards, { canonical: true });
+        setSbStatus('✅ 이 기기가 최종본');
+        flash(`최종본 지정 완료 · ${n}개 카드`);
+      } catch (e) {
+        flash('최종본 지정 실패: ' + e.message);
+      } finally {
+        setSbLoading(false);
+      }
+    });
   };
   const pullFromCloud = async () => {
     if (!getSbCfg()) {
@@ -2688,15 +2861,14 @@ function Settings({
     }
     setSbLoading(true);
     try {
-      const cloudCards = await sbLoadAll();
-      if (!cloudCards || cloudCards.length === 0) {
-        flash('클라우드에 데이터가 없습니다');
-        setSbLoading(false);
-        return;
-      }
-      showConfirm(`클라우드에서 ${cloudCards.length}개 카드를 가져올까요?<br><span style="font-size:11px;color:#9a9088">로컬 데이터를 클라우드 데이터로 교체합니다</span>`, () => {
+      const cloudAll = await sbLoadAll({ includeDeleted: true }) || [];
+      const cloudCards = normalizeCards(cloudAll);
+      const cloudVersion = await sbGetMeta('canonical_version').catch(() => null);
+      showConfirm(`클라우드 기준 ${cloudCards.length}개 카드로 맞출까요?<br><span style="font-size:11px;color:#9a9088">로컬 전용 항목은 보존하지 않고 교체합니다</span>`, () => {
         update(cloudCards);
-        flash(`⬇️ ${cloudCards.length}개 카드를 클라우드에서 불러옴`);
+        saveLocalTombstones(cloudAll.filter(card => card.deleted_at));
+        if (cloudVersion) saveLocalSyncMeta({ canonical_version: cloudVersion, last_sync_mode: 'manual_pull' });
+        flash(`⬇️ ${cloudCards.length}개 카드를 클라우드 기준으로 반영`);
       });
     } catch (e) {
       flash('Pull 실패: ' + e.message);
@@ -2706,6 +2878,7 @@ function Settings({
   const disconnectSb = () => {
     showConfirm('Supabase 연결을 해제할까요?<br><span style="font-size:11px;color:#9a9088">로컬 데이터는 유지됩니다</span>', () => {
       localStorage.removeItem(SB_CFG_KEY);
+      localStorage.removeItem(SYNC_META_KEY);
       setSbUrl('');
       setSbKey('');
       setSbStatus('미설정');
@@ -2733,9 +2906,18 @@ function Settings({
     }
   };
   const clearAll = () => {
-    showConfirm('모든 카드 데이터를 삭제할까요?<br><span style="font-size:11px;color:#f85149">되돌릴 수 없습니다. 먼저 백업을 권장합니다.</span>', () => {
-      update([]);
-      flash('전체 데이터 삭제됨');
+    showConfirm('모든 카드 데이터를 삭제할까요?<br><span style="font-size:11px;color:#f85149">되돌릴 수 없습니다. Supabase 연결 중이면 빈 최종본으로도 표시합니다.</span>', async () => {
+      setSbLoading(true);
+      try {
+        addLocalTombstones(cards);
+        update([]);
+        if (getSbCfg()) await sbPushAll([], { canonical: true });
+        flash('전체 데이터 삭제됨');
+      } catch (e) {
+        flash('삭제 동기화 실패: ' + e.message);
+      } finally {
+        setSbLoading(false);
+      }
     });
   };
   const sec = title => /*#__PURE__*/React.createElement("div", {
@@ -2812,7 +2994,7 @@ function Settings({
       gap: 8,
       marginBottom: 8
     }
-  }, btn('⬆️ 로컬→클라우드', pushToCloud, C.amber, sbLoading), btn('⬇️ 클라우드→로컬', pullFromCloud, C.teal, sbLoading)), getSbCfg() && /*#__PURE__*/React.createElement("button", {
+  }, btn('⬆️ 이 기기를 최종본으로', pushToCloud, C.amber, sbLoading), btn('⬇️ 클라우드 기준으로 맞춤', pullFromCloud, C.teal, sbLoading)), getSbCfg() && /*#__PURE__*/React.createElement("button", {
     className: "tap",
     onClick: disconnectSb,
     style: {
@@ -2843,7 +3025,7 @@ function Settings({
     style: {
       color: C.amber
     }
-  }, "CREATE TABLE usmle_cards (id text PRIMARY KEY, data text NOT NULL);", /*#__PURE__*/React.createElement("br", null), "ALTER TABLE usmle_cards ENABLE ROW LEVEL SECURITY;", /*#__PURE__*/React.createElement("br", null), "CREATE POLICY \"allow_all\" ON usmle_cards FOR ALL USING (true) WITH CHECK (true);"))), /*#__PURE__*/React.createElement("div", {
+  }, "CREATE TABLE IF NOT EXISTS usmle_cards (id text PRIMARY KEY, data text NOT NULL);", /*#__PURE__*/React.createElement("br", null), "ALTER TABLE usmle_cards ADD COLUMN IF NOT EXISTS created_at timestamptz DEFAULT now();", /*#__PURE__*/React.createElement("br", null), "ALTER TABLE usmle_cards ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now();", /*#__PURE__*/React.createElement("br", null), "ALTER TABLE usmle_cards ADD COLUMN IF NOT EXISTS deleted_at timestamptz;", /*#__PURE__*/React.createElement("br", null), "CREATE TABLE IF NOT EXISTS language_sync_meta (key text PRIMARY KEY, value text, updated_at timestamptz DEFAULT now());", /*#__PURE__*/React.createElement("br", null), "ALTER TABLE usmle_cards ENABLE ROW LEVEL SECURITY;", /*#__PURE__*/React.createElement("br", null), "ALTER TABLE language_sync_meta ENABLE ROW LEVEL SECURITY;", /*#__PURE__*/React.createElement("br", null), "CREATE POLICY \"allow_all\" ON usmle_cards FOR ALL USING (true) WITH CHECK (true);", /*#__PURE__*/React.createElement("br", null), "CREATE POLICY \"allow_all_meta\" ON language_sync_meta FOR ALL USING (true) WITH CHECK (true);"))), /*#__PURE__*/React.createElement("div", {
     style: {
       background: C.panel,
       border: `1px solid ${C.line}`,
