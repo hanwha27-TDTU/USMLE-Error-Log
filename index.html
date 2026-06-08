@@ -1219,6 +1219,177 @@ function TxtConverterModal({
   }, "\uACB0\uACFC \uBCF5\uC0AC")))));
 }
 
+function DeveloperModal({
+  onClose
+}) {
+  const D = {
+    bg: '#111827',
+    panel: '#0f172a',
+    panel2: '#1f2937',
+    line: 'rgba(148,163,184,.24)',
+    text: '#e5edf7',
+    dim: '#94a3b8'
+  };
+  const info = [
+    ['개발자', '김부건 (Kim Bugeon)'],
+    ['소속', 'Tashkent State Medical University'],
+    ['최초 개발일', '2026년 6월 8일'],
+    ['앱 이름', 'Dr. Bugeon의 USMLE 오답노트'],
+    ['최근 수정', '2026년 6월 8일 · 개발자 정보창 추가'],
+    ['현재 파일명', '현재 HTML 파일']
+  ];
+  const updates = [{
+    title: '최신 · 개발자 정보창 추가',
+    color: '#86efac',
+    items: ['우측 상단 개발자 버튼과 별도 정보창 추가', '다크 모달에 앱 색상 계열의 주황·청록 포인트 적용', '앱 목적과 최근 업데이트 이력을 한 화면에서 확인']
+  }, {
+    title: '학습 흐름 개선',
+    color: C.amber,
+    items: ['틀린 카드는 오늘 due로 남겨 같은 세션 안에서 다시 인출', '채점 후 due 큐 재계산 시 다음 카드가 건너뛰지 않도록 보정', '원문 객관식은 Stem 인출과 분리해 별도 창에서 확인']
+  }, {
+    title: '동기화 안정화',
+    color: C.teal,
+    items: ['Supabase canonical_version으로 최종본 기준 동기화 지원', 'deleted_at tombstone으로 삭제 동기화 보강', 'updated_at desc 로드와 res.ok 검증으로 조용한 동기화 실패 방지']
+  }, {
+    title: '입력·백업 안정화',
+    color: '#c4b5fd',
+    items: ['TXT 변환 도구와 빠른 객관식 입력 추가', 'JSON 가져오기에서 중복 ID는 updated_at 최신본 기준 병합', 'Seed 카드 고정 ID 적용 및 다운로드 URL 해제 지연']
+  }];
+  const infoBox = ([k, v]) => /*#__PURE__*/React.createElement("div", {
+    key: k
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: D.dim,
+      fontSize: 12,
+      fontWeight: 800,
+      marginBottom: 6
+    }
+  }, k), /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: D.panel,
+      border: `1px solid ${D.line}`,
+      borderRadius: 10,
+      color: D.text,
+      padding: '14px 16px',
+      fontSize: 15.5,
+      minHeight: 52,
+      display: 'flex',
+      alignItems: 'center'
+    }
+  }, v));
+  const updateBox = u => /*#__PURE__*/React.createElement("div", {
+    key: u.title,
+    style: {
+      background: D.panel2,
+      border: `1px solid ${D.line}`,
+      borderRadius: 12,
+      padding: '15px 18px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: u.color,
+      fontWeight: 900,
+      marginBottom: 8,
+      fontSize: 15
+    }
+  }, u.title), /*#__PURE__*/React.createElement("ul", {
+    style: {
+      margin: 0,
+      paddingLeft: 18,
+      color: D.dim,
+      lineHeight: 1.65,
+      fontSize: 13.5
+    }
+  }, u.items.map(item => /*#__PURE__*/React.createElement("li", {
+    key: item
+  }, item))));
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: 'fixed',
+      inset: 0,
+      zIndex: 9997,
+      background: 'rgba(15,23,42,0.58)',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      padding: 18
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fade",
+    style: {
+      width: 'min(980px, 100%)',
+      maxHeight: '88vh',
+      overflow: 'auto',
+      background: D.bg,
+      border: `1px solid ${D.line}`,
+      borderRadius: 14,
+      boxShadow: '0 24px 80px rgba(2,6,23,.42)'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: 'sticky',
+      top: 0,
+      zIndex: 1,
+      background: D.bg,
+      borderBottom: `1px solid ${D.line}`,
+      padding: '18px 20px',
+      display: 'flex',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      gap: 14
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "serif",
+    style: {
+      color: D.text,
+      fontSize: 24,
+      fontWeight: 700
+    }
+  }, "👨‍💻 개발자 정보"), /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: onClose,
+    style: {
+      background: `${C.red}18`,
+      border: `1px solid ${C.red}66`,
+      borderRadius: 10,
+      color: '#fecaca',
+      padding: '8px 13px',
+      fontSize: 12.5,
+      fontWeight: 900
+    }
+  }, "닫기")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: 20,
+      display: 'grid',
+      gap: 18
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'grid',
+      gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
+      gap: 14
+    }
+  }, info.map(infoBox)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: D.dim,
+      fontSize: 14,
+      lineHeight: 1.7
+    }
+  }, "본 HTML 앱은 USMLE 오답을 cue-only active recall로 재구성하고, 원문 객관식·오답 원인·생각 로직·SRS 복습·Supabase 기기 동기화를 함께 관리하기 위한 개인 학습용 프로토타입입니다."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: D.dim,
+      fontWeight: 900,
+      fontSize: 14,
+      letterSpacing: '.03em'
+    }
+  }, "업데이트 이력"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'grid',
+      gap: 12
+    }
+  }, updates.map(updateBox)))));
+}
+
 /* ============================================================
    APP
    ============================================================ */
@@ -1227,6 +1398,7 @@ function App() {
   const [view, setView] = useState('recall');
   const [toast, setToast] = useState('');
   const [txtConverterOpen, setTxtConverterOpen] = useState(false);
+  const [developerOpen, setDeveloperOpen] = useState(false);
   useEffect(() => {
     (async () => {
       try {
@@ -1263,6 +1435,15 @@ function App() {
     setTimeout(() => setToast(''), 1800);
   };
   const dueCount = useMemo(() => cards ? cards.filter(isDue).length : 0, [cards]);
+  const topBtn = (color, active = false) => ({
+    background: active ? `${color}22` : `${color}12`,
+    border: `1px solid ${active ? color : `${color}55`}`,
+    color,
+    borderRadius: 8,
+    padding: '7px 10px',
+    fontSize: 12,
+    fontWeight: 800
+  });
   if (!cards) return /*#__PURE__*/React.createElement("div", {
     className: "uwn",
     style: {
@@ -1287,18 +1468,6 @@ function App() {
     id: 'library',
     kr: '목록',
     en: 'Library'
-  }, {
-    id: 'dashboard',
-    kr: '대시보드',
-    en: 'Dashboard'
-  }, {
-    id: 'export',
-    kr: '내보내기',
-    en: 'Export'
-  }, {
-    id: 'settings',
-    kr: '설정',
-    en: 'Settings'
   }];
   return /*#__PURE__*/React.createElement("div", {
     className: "uwn",
@@ -1360,17 +1529,25 @@ function App() {
     }
   }, /*#__PURE__*/React.createElement("button", {
     className: "tap",
+    onClick: () => setView('dashboard'),
+    style: topBtn(C.green, view === 'dashboard')
+  }, "\uD1B5\uACC4"), /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: () => setView('export'),
+    style: topBtn(C.teal, view === 'export')
+  }, "\uB370\uC774\uD130 \uAD00\uB9AC"), /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: () => setView('settings'),
+    style: topBtn(C.dim, view === 'settings')
+  }, "\uC124\uC815"), /*#__PURE__*/React.createElement("button", {
+    className: "tap",
     onClick: () => setTxtConverterOpen(true),
-    style: {
-      background: `${C.teal}12`,
-      border: `1px solid ${C.teal}55`,
-      color: C.teal,
-      borderRadius: 8,
-      padding: '7px 10px',
-      fontSize: 12,
-      fontWeight: 800
-    }
-  }, "TXT \uBCC0\uD658 \uB3C4\uAD6C"), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
+    style: topBtn(C.teal)
+  }, "TXT \uBCC0\uD658 \uB3C4\uAD6C"), /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: () => setDeveloperOpen(true),
+    style: topBtn(C.amber)
+  }, "\uAC1C\uBC1C\uC790"), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
     style: {
       color: C.text,
       fontWeight: 600
@@ -1451,6 +1628,8 @@ function App() {
     flash: flash
   })), txtConverterOpen && /*#__PURE__*/React.createElement(TxtConverterModal, {
     onClose: () => setTxtConverterOpen(false)
+  }), developerOpen && /*#__PURE__*/React.createElement(DeveloperModal, {
+    onClose: () => setDeveloperOpen(false)
   }), toast && /*#__PURE__*/React.createElement("div", {
     className: "fade",
     style: {
@@ -3092,7 +3271,7 @@ function Export({
       textTransform: 'uppercase',
       letterSpacing: '.05em'
     }
-  }, "\uB0B4\uBCF4\uB0B4\uAE30 \xB7 Export"), /*#__PURE__*/React.createElement("div", {
+  }, "\uB370\uC774\uD130 \uAD00\uB9AC \xB7 Data Management"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'flex',
       gap: 9,
