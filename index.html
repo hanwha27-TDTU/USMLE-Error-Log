@@ -663,6 +663,42 @@ const shuffle = arr => {
   }
   return a;
 };
+function parseQuickMcq(raw) {
+  const questions = [];
+  let current = null;
+  const finish = () => {
+    if (!current) return;
+    const stem = current.stem.join('\n').trim();
+    const options = current.options.map(o => o.trim()).filter(Boolean);
+    if (stem && options.length >= 2 && current.answerIndex >= 0) {
+      questions.push({ stem, options, answerIndex: current.answerIndex });
+    }
+  };
+  String(raw || '').split(/\r?\n/).forEach(line => {
+    const text = line.trim().replace(/^['"`]+/, '').trim();
+    if (!text) return;
+    const marker = text[0];
+    const body = text.slice(1).trim().replace(/[;'"]+$/, '').trim();
+    if (marker === '#') {
+      finish();
+      current = { stem: [body], options: [], answerIndex: -1 };
+      return;
+    }
+    if (!current) current = { stem: [], options: [], answerIndex: -1 };
+    if ((marker === '+' || marker === '-') && body) {
+      if (marker === '+') current.answerIndex = current.options.length;
+      current.options.push(body);
+      return;
+    }
+    if (current.options.length) {
+      current.options[current.options.length - 1] += ` ${text}`;
+    } else {
+      current.stem.push(text);
+    }
+  });
+  finish();
+  return questions;
+}
 
 /* ── seed cards ── */
 const SEED = [{
@@ -1120,10 +1156,44 @@ function Capture({
 }) {
   const [d, setD] = useState(emptyDraft);
   const [aiLoading, setAiLoading] = useState(false);
+  const [mcqQuickText, setMcqQuickText] = useState('');
+  const mcqFileRef = useRef(null);
   const set = (k, v) => setD(p => ({
     ...p,
     [k]: v
   }));
+  const applyQuickMcq = text => {
+    const parsed = parseQuickMcq(text);
+    if (!parsed.length) {
+      flash('인식된 객관식 문제가 없습니다');
+      return;
+    }
+    const q = parsed[0];
+    const correct = q.options[q.answerIndex] || '';
+    setD(p => ({
+      ...p,
+      hasMcq: true,
+      stem: p.stem.trim() ? p.stem : q.stem,
+      correct: p.correct.trim() ? p.correct : correct,
+      mcqStem: q.stem,
+      mcqOptions: q.options,
+      mcqAnswerIndex: q.answerIndex
+    }));
+    flash(parsed.length > 1 ? `객관식 ${parsed.length}개 인식 · 첫 번째 문제 적용` : '객관식 문제 적용됨');
+  };
+  const loadQuickMcqFile = e => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      const text = String(ev.target.result || '');
+      setMcqQuickText(text);
+      applyQuickMcq(text);
+    };
+    reader.onerror = () => flash('TXT 파일을 읽지 못했습니다');
+    reader.readAsText(file);
+    e.target.value = '';
+  };
   const aiAutofill = async () => {
     if (!d.stem.trim() || !d.correct.trim()) {
       flash('stem과 정답을 먼저 입력해주세요');
@@ -1299,7 +1369,79 @@ function Capture({
       display: 'grid',
       gap: 8
     }
-  }, /*#__PURE__*/React.createElement("textarea", {
+  }, /*#__PURE__*/React.createElement("input", {
+    ref: mcqFileRef,
+    type: "file",
+    accept: ".txt,text/plain",
+    style: {
+      display: 'none'
+    },
+    onChange: loadQuickMcqFile
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'grid',
+      gap: 8,
+      padding: 12,
+      border: `1px solid ${C.line}`,
+      borderRadius: 9,
+      background: C.bg
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      flexWrap: 'wrap'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: C.dim,
+      fontWeight: 700
+    }
+  }, "빠른 객관식 입력  # 질문 / + 정답 / - 오답"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 7,
+      flexWrap: 'wrap'
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: () => mcqFileRef.current?.click(),
+    style: {
+      background: `${C.teal}12`,
+      color: C.teal,
+      border: `1px solid ${C.teal}55`,
+      borderRadius: 8,
+      padding: '7px 11px',
+      fontSize: 12.5,
+      fontWeight: 700
+    }
+  }, "TXT 불러오기"), /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: () => applyQuickMcq(mcqQuickText),
+    style: {
+      background: `${C.amber}14`,
+      color: C.amber,
+      border: `1px solid ${C.amber}66`,
+      borderRadius: 8,
+      padding: '7px 11px',
+      fontSize: 12.5,
+      fontWeight: 700
+    }
+  }, "아래 내용 적용"))), /*#__PURE__*/React.createElement("textarea", {
+    style: {
+      ...field,
+      minHeight: 120,
+      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+      fontSize: 13
+    },
+    value: mcqQuickText,
+    onChange: e => setMcqQuickText(e.target.value),
+    onBlur: () => mcqQuickText.trim() && applyQuickMcq(mcqQuickText),
+    placeholder: "# 다음 중 이 앱의 개발자는 누구인가요?\n+ 김부건\n- 박근혜\n- 박정희\n- 이승만\n- 대중씨"
+  })), /*#__PURE__*/React.createElement("textarea", {
     style: {
       ...field,
       minHeight: 72
