@@ -520,7 +520,7 @@ Generate concise USMLE-style content. Respond ONLY with valid JSON (no markdown,
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url; a.download = name; a.click();
-      URL.revokeObjectURL(url);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
     }
 
     /* ── Confirm dialog ── */
@@ -615,7 +615,7 @@ function schedule(srs, pass) {
   const q = pass ? 4 : 2;
   if (q < 3) {
     reps = 0;
-    interval = 1;
+    interval = 0;
   } else {
     if (reps === 0) interval = 1;else if (reps === 1) interval = 6;else interval = Math.round(interval * ease);
     reps++;
@@ -699,10 +699,59 @@ function parseQuickMcq(raw) {
   finish();
   return questions;
 }
+function convertLooseMcqToQuickText(raw) {
+  const positive = /(정답|답|correct|answer|✅|✔|☑)/i;
+  const negative = /(오답|wrong|incorrect|distractor|✗|×)/i;
+  const optionPattern = /^\s*([+\-]|✅|✔|☑)?\s*(?:(?:[A-Za-z]\s*[\.)])|(?:\d+\s*\))|(?:[①②③④⑤⑥⑦⑧⑨]))\s*(.*)$/u;
+  const questionPattern = /^\s*(?:Q\.?|Question|문제|문항)?\s*\d*[\.)]?\s*(.+\?)\s*$/iu;
+  const clean = text => String(text || '').replace(/\s+/g, ' ').replace(/[;；]\s*$/, '').trim();
+  const questions = [];
+  let current = null;
+  const finish = () => {
+    if (!current) return;
+    const q = clean(current.question.join(' '));
+    const opts = current.options.filter(o => clean(o.text));
+    if (q && opts.length >= 2) questions.push({ question: q, options: opts });
+  };
+  String(raw || '').replace(/\r\n?/g, '\n').split('\n').forEach(line => {
+    const text = line.trim();
+    if (!text) return;
+    if (text.startsWith('#')) {
+      finish();
+      current = { question: [text.slice(1).trim()], options: [] };
+      return;
+    }
+    const opt = text.match(optionPattern);
+    if (opt && current) {
+      const explicit = opt[1];
+      let body = clean(opt[2]);
+      const isCorrect = explicit === '+' || explicit === '✅' || explicit === '✔' || explicit === '☑' || positive.test(body);
+      body = body.replace(positive, '').replace(negative, '').trim();
+      current.options.push({ text: body, correct: isCorrect });
+      return;
+    }
+    if (!current || questionPattern.test(text)) {
+      finish();
+      current = { question: [text.replace(/^\s*(?:Q\.?|Question|문제|문항)?\s*\d*[\.)]?\s*/iu, '')], options: [] };
+      return;
+    }
+    if (current.options.length) {
+      current.options[current.options.length - 1].text += ` ${text}`;
+    } else if (current) {
+      current.question.push(text);
+    }
+  });
+  finish();
+  return questions.map(q => {
+    const lines = [`# ${q.question}`];
+    q.options.forEach(o => lines.push(`${o.correct ? '+' : '-'} ${clean(o.text)}`));
+    return lines.join('\n');
+  }).join('\n\n');
+}
 
 /* ── seed cards ── */
 const SEED = [{
-  id: uid(),
+  id: 'seed-bartter-syndrome',
   stem: '유전성 · 저K⁺ + 대사성 알칼리증 + 정상혈압 + 고Ca²⁺뇨 (loop 부위)',
   myAnswer: 'Gitelman syndrome',
   correct: 'Bartter syndrome',
@@ -722,7 +771,7 @@ const SEED = [{
   },
   srs: null
 }, {
-  id: uid(),
+  id: 'seed-ards-berlin-criteria',
   stem: '패혈증 후 급성 저산소혈증 + 양측 침윤 + P/F < 300 + 심부전 아님',
   myAnswer: 'Cardiogenic pulmonary edema',
   correct: 'ARDS (Berlin criteria)',
@@ -738,7 +787,7 @@ const SEED = [{
   originalMcq: null,
   srs: null
 }, {
-  id: uid(),
+  id: 'seed-acute-tubular-necrosis',
   stem: '조영제/aminoglycoside 후 AKI + 갈색 과립 원주 + BUN/Cr < 20 + FENa > 2%',
   myAnswer: 'Prerenal azotemia',
   correct: 'Acute tubular necrosis (ATN)',
@@ -785,6 +834,22 @@ const gcss = `
       .uwn ::-webkit-scrollbar-track{background:rgba(0,0,0,.04);}
       .uwn ::-webkit-scrollbar-thumb{background:rgba(0,0,0,.18);border-radius:8px;}
       .uwn ::-webkit-scrollbar-thumb:hover{background:rgba(0,0,0,.28);}
+      .capture-grid{grid-template-columns:minmax(0,1fr) minmax(360px,420px);align-items:start;}
+      .capture-grid>*{grid-column:1;}
+      .capture-grid>.mcq-side{grid-column:2;grid-row:1 / span 9;position:sticky;top:14px;}
+      .capture-grid.mcq-collapsed{grid-template-columns:minmax(0,1fr) 54px;}
+      .capture-grid.mcq-collapsed>.mcq-side{overflow:hidden;}
+      .capture-grid.mcq-collapsed>.mcq-side .mcq-content{display:none;}
+      .capture-grid.mcq-collapsed .mcq-head{justify-content:center!important;}
+      .capture-grid.mcq-collapsed .mcq-head label{display:none!important;}
+      .mcq-rail-label{display:none;}
+      .capture-grid.mcq-collapsed .mcq-rail-label{display:block;writing-mode:vertical-rl;text-orientation:mixed;margin:8px auto 0;font-size:12px;color:#64748b;font-weight:700;}
+      @media(max-width:980px){
+        .capture-grid,.capture-grid.mcq-collapsed{grid-template-columns:1fr;}
+        .capture-grid>.mcq-side{grid-column:1;grid-row:auto;position:static;}
+        .capture-grid.mcq-collapsed>.mcq-side .mcq-content{display:block;}
+        .capture-grid.mcq-collapsed .mcq-rail-label{display:none;}
+      }
       @keyframes fadeUp{from{opacity:0;transform:translateY(5px);}to{opacity:1;transform:none;}}
       .fade{animation:fadeUp .25s ease both;}
       .uwn{background:transparent;}
@@ -898,6 +963,262 @@ function DetailRow({
   }, v));
 }
 
+function OriginalMcqModal({
+  card,
+  revealed,
+  onClose
+}) {
+  if (!card?.originalMcq) return null;
+  const mcq = card.originalMcq;
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: 'fixed',
+      inset: 0,
+      zIndex: 9997,
+      background: 'rgba(15,23,42,0.42)',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      padding: 18
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 'min(760px, 100%)',
+      maxHeight: '86vh',
+      overflow: 'auto',
+      background: C.panel,
+      color: C.text,
+      border: `1px solid ${C.line2}`,
+      borderRadius: 12,
+      boxShadow: '0 24px 70px rgba(15,23,42,.28)'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: 'sticky',
+      top: 0,
+      zIndex: 1,
+      background: C.panel,
+      borderBottom: `1px solid ${C.line}`,
+      padding: '14px 16px',
+      display: 'flex',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      gap: 12
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 14,
+      fontWeight: 800,
+      color: C.dim
+    }
+  }, "\uC6D0\uBB38 \uAC1D\uAD00\uC2DD \uBB38\uC81C"), /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: onClose,
+    style: {
+      background: `${C.red}10`,
+      border: `1px solid ${C.red}66`,
+      borderRadius: 8,
+      color: C.red,
+      padding: '7px 12px',
+      fontSize: 12.5,
+      fontWeight: 800
+    }
+  }, "\uB2EB\uAE30")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: 18,
+      display: 'grid',
+      gap: 14
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      lineHeight: 1.65,
+      fontSize: 15,
+      whiteSpace: 'pre-wrap'
+    }
+  }, mcq.stemFull), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'grid',
+      gap: 8
+    }
+  }, mcq.options.map((text, idx) => {
+    const isCorrect = idx === mcq.answerIndex;
+    return /*#__PURE__*/React.createElement("div", {
+      key: idx,
+      style: {
+        display: 'flex',
+        gap: 10,
+        alignItems: 'flex-start',
+        border: `1px solid ${revealed && isCorrect ? C.green : C.line2}`,
+        background: revealed && isCorrect ? `${C.green}12` : C.bg,
+        borderRadius: 9,
+        padding: '10px 12px',
+        fontSize: 14,
+        lineHeight: 1.55
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        flexShrink: 0,
+        width: 22,
+        height: 22,
+        borderRadius: '50%',
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        background: revealed && isCorrect ? C.green : C.panel,
+        border: `1px solid ${revealed && isCorrect ? C.green : C.line2}`,
+        color: revealed && isCorrect ? '#fff' : C.dim,
+        fontWeight: 800,
+        fontSize: 12
+      }
+    }, String.fromCharCode(65 + idx)), /*#__PURE__*/React.createElement("span", {
+      style: {
+        flex: 1
+      }
+    }, text), revealed && isCorrect && /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.green,
+        fontWeight: 800,
+        whiteSpace: 'nowrap'
+      }
+    }, "\uC815\uB2F5"));
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11.5,
+      color: C.faint,
+      borderTop: `1px solid ${C.line}`,
+      paddingTop: 10
+    }
+  }, revealed ? "\uC815\uB2F5 \uACF5\uAC1C \uD6C4\uB77C \uC6D0\uBB38 \uC815\uB2F5\uC744 \uD45C\uC2DC\uD569\uB2C8\uB2E4." : "\uC544\uC9C1 \uC815\uB2F5\uC744 \uACF5\uAC1C\uD558\uC9C0 \uC54A\uC544 \uC6D0\uBB38 \uC815\uB2F5 \uD45C\uC2DC\uB294 \uC228\uAE41\uB2C8\uB2E4."))));
+}
+
+function TxtConverterModal({
+  onClose
+}) {
+  const [src, setSrc] = useState('');
+  const [out, setOut] = useState('');
+  const convertNow = () => setOut(convertLooseMcqToQuickText(src));
+  const copyOut = async () => {
+    try {
+      await navigator.clipboard.writeText(out);
+      showGlobalToast('변환 결과를 복사했습니다');
+    } catch {
+      showGlobalToast('복사 실패: 결과를 직접 선택해 복사해주세요');
+    }
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: 'fixed',
+      inset: 0,
+      zIndex: 9997,
+      background: 'rgba(15,23,42,0.42)',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      padding: 18
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 'min(1120px, 100%)',
+      maxHeight: '88vh',
+      overflow: 'auto',
+      background: C.panel,
+      border: `1px solid ${C.line2}`,
+      borderRadius: 12,
+      boxShadow: '0 24px 70px rgba(15,23,42,.28)'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: 'sticky',
+      top: 0,
+      zIndex: 1,
+      background: C.panel,
+      borderBottom: `1px solid ${C.line}`,
+      padding: '14px 16px',
+      display: 'flex',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      gap: 12
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 800,
+      color: C.dim
+    }
+  }, "TXT \uBCC0\uD658 \uB3C4\uAD6C"), /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: onClose,
+    style: {
+      background: `${C.red}10`,
+      border: `1px solid ${C.red}66`,
+      borderRadius: 8,
+      color: C.red,
+      padding: '7px 12px',
+      fontSize: 12.5,
+      fontWeight: 800
+    }
+  }, "\uB2EB\uAE30")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: 16,
+      display: 'grid',
+      gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+      gap: 14
+    }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+    style: lbl
+  }, "\uC6D0\uBCF8 \uBD99\uC5EC\uB123\uAE30"), /*#__PURE__*/React.createElement("textarea", {
+    style: {
+      ...field,
+      minHeight: 460,
+      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'
+    },
+    value: src,
+    onChange: e => setSrc(e.target.value),
+    placeholder: "Q. 다음 중 이 앱의 개발자는 누구인가요?\nA) 김부건 정답\nB) 박근혜\nC) 박정희\nD) 이승만\nE) 대중씨"
+  })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+    style: lbl
+  }, "\uBCC0\uD658 \uACB0\uACFC  # / + / -"), /*#__PURE__*/React.createElement("textarea", {
+    style: {
+      ...field,
+      minHeight: 460,
+      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'
+    },
+    value: out,
+    onChange: e => setOut(e.target.value),
+    placeholder: "# 문제\n+ 정답 보기\n- 오답 보기"
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      gridColumn: '1 / -1',
+      display: 'flex',
+      gap: 8,
+      justifyContent: 'flex-end',
+      flexWrap: 'wrap'
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: convertNow,
+    style: {
+      background: C.amber,
+      color: '#14110f',
+      border: 'none',
+      borderRadius: 8,
+      padding: '10px 16px',
+      fontWeight: 800
+    }
+  }, "\uBCC0\uD658"), /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: copyOut,
+    disabled: !out.trim(),
+    style: {
+      background: `${C.teal}12`,
+      color: C.teal,
+      border: `1px solid ${C.teal}55`,
+      borderRadius: 8,
+      padding: '10px 16px',
+      fontWeight: 800
+    }
+  }, "\uACB0\uACFC \uBCF5\uC0AC")))));
+}
+
 /* ============================================================
    APP
    ============================================================ */
@@ -905,6 +1226,7 @@ function App() {
   const [cards, setCards] = useState(null);
   const [view, setView] = useState('recall');
   const [toast, setToast] = useState('');
+  const [txtConverterOpen, setTxtConverterOpen] = useState(false);
   useEffect(() => {
     (async () => {
       try {
@@ -1029,9 +1351,26 @@ function App() {
     style: {
       fontSize: 12,
       color: C.dim,
-      textAlign: 'right'
+      textAlign: 'right',
+      display: 'flex',
+      alignItems: 'center',
+      gap: 10,
+      flexWrap: 'wrap',
+      justifyContent: 'flex-end'
     }
-  }, /*#__PURE__*/React.createElement("span", {
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: () => setTxtConverterOpen(true),
+    style: {
+      background: `${C.teal}12`,
+      border: `1px solid ${C.teal}55`,
+      color: C.teal,
+      borderRadius: 8,
+      padding: '7px 10px',
+      fontSize: 12,
+      fontWeight: 800
+    }
+  }, "TXT \uBCC0\uD658 \uB3C4\uAD6C"), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
     style: {
       color: C.text,
       fontWeight: 600
@@ -1041,7 +1380,7 @@ function App() {
       color: dueCount ? C.amber : C.dim,
       fontWeight: 600
     }
-  }, dueCount), " due")), /*#__PURE__*/React.createElement("div", {
+  }, dueCount), " due"))), /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'flex',
       gap: 4,
@@ -1110,7 +1449,9 @@ function App() {
     cards: cards,
     update: update,
     flash: flash
-  })), toast && /*#__PURE__*/React.createElement("div", {
+  })), txtConverterOpen && /*#__PURE__*/React.createElement(TxtConverterModal, {
+    onClose: () => setTxtConverterOpen(false)
+  }), toast && /*#__PURE__*/React.createElement("div", {
     className: "fade",
     style: {
       position: 'sticky',
@@ -1157,6 +1498,7 @@ function Capture({
   const [d, setD] = useState(emptyDraft);
   const [aiLoading, setAiLoading] = useState(false);
   const [mcqQuickText, setMcqQuickText] = useState('');
+  const [mcqCollapsed, setMcqCollapsed] = useState(false);
   const mcqFileRef = useRef(null);
   const set = (k, v) => setD(p => ({
     ...p,
@@ -1169,12 +1511,9 @@ function Capture({
       return;
     }
     const q = parsed[0];
-    const correct = q.options[q.answerIndex] || '';
     setD(p => ({
       ...p,
       hasMcq: true,
-      stem: p.stem.trim() ? p.stem : q.stem,
-      correct: p.correct.trim() ? p.correct : correct,
       mcqStem: q.stem,
       mcqOptions: q.options,
       mcqAnswerIndex: q.answerIndex
@@ -1254,12 +1593,12 @@ function Capture({
     gap: 12
   };
   return /*#__PURE__*/React.createElement("div", {
-    className: "fade",
+    className: `fade capture-grid ${mcqCollapsed ? 'mcq-collapsed' : ''}`,
     style: {
       display: 'grid',
       gap: 14,
       width: '100%',
-      maxWidth: 1040
+      maxWidth: 1120
     }
   }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
     style: lbl
@@ -1369,79 +1708,7 @@ function Capture({
       display: 'grid',
       gap: 8
     }
-  }, /*#__PURE__*/React.createElement("input", {
-    ref: mcqFileRef,
-    type: "file",
-    accept: ".txt,text/plain",
-    style: {
-      display: 'none'
-    },
-    onChange: loadQuickMcqFile
-  }), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: 'grid',
-      gap: 8,
-      padding: 12,
-      border: `1px solid ${C.line}`,
-      borderRadius: 9,
-      background: C.bg
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: 'flex',
-      gap: 8,
-      alignItems: 'center',
-      justifyContent: 'space-between',
-      flexWrap: 'wrap'
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 12.5,
-      color: C.dim,
-      fontWeight: 700
-    }
-  }, "빠른 객관식 입력  # 질문 / + 정답 / - 오답"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: 'flex',
-      gap: 7,
-      flexWrap: 'wrap'
-    }
-  }, /*#__PURE__*/React.createElement("button", {
-    className: "tap",
-    onClick: () => mcqFileRef.current?.click(),
-    style: {
-      background: `${C.teal}12`,
-      color: C.teal,
-      border: `1px solid ${C.teal}55`,
-      borderRadius: 8,
-      padding: '7px 11px',
-      fontSize: 12.5,
-      fontWeight: 700
-    }
-  }, "TXT 불러오기"), /*#__PURE__*/React.createElement("button", {
-    className: "tap",
-    onClick: () => applyQuickMcq(mcqQuickText),
-    style: {
-      background: `${C.amber}14`,
-      color: C.amber,
-      border: `1px solid ${C.amber}66`,
-      borderRadius: 8,
-      padding: '7px 11px',
-      fontSize: 12.5,
-      fontWeight: 700
-    }
-  }, "아래 내용 적용"))), /*#__PURE__*/React.createElement("textarea", {
-    style: {
-      ...field,
-      minHeight: 120,
-      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-      fontSize: 13
-    },
-    value: mcqQuickText,
-    onChange: e => setMcqQuickText(e.target.value),
-    onBlur: () => mcqQuickText.trim() && applyQuickMcq(mcqQuickText),
-    placeholder: "# 다음 중 이 앱의 개발자는 누구인가요?\n+ 김부건\n- 박근혜\n- 박정희\n- 이승만\n- 대중씨"
-  })), /*#__PURE__*/React.createElement("textarea", {
+  }, /*#__PURE__*/React.createElement("textarea", {
     style: {
       ...field,
       minHeight: 72
@@ -1502,11 +1769,20 @@ function Capture({
     onChange: e => set('source', e.target.value),
     placeholder: "UWorld Q1234"
   }))), /*#__PURE__*/React.createElement("div", {
+    className: "mcq-side",
     style: {
       border: `1px solid ${C.line}`,
       borderRadius: 10,
       padding: 14,
       background: C.panel
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "mcq-head",
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: 8
     }
   }, /*#__PURE__*/React.createElement("label", {
     style: {
@@ -1532,14 +1808,112 @@ function Capture({
       fontWeight: 400,
       fontSize: 12
     }
-  }, "\xB7 \uC7AC\uC2DC\uB3C4 \uC2DC \uBCF4\uAE30 \uC154\uD50C")), d.hasMcq && /*#__PURE__*/React.createElement("div", {
+  }, "\xB7 \uC7AC\uC2DC\uB3C4 \uC2DC \uBCF4\uAE30 \uC154\uD50C")), /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: () => setMcqCollapsed(p => !p),
+    title: mcqCollapsed ? '원문 문제 펼치기' : '원문 문제 접기',
+    style: {
+      flexShrink: 0,
+      width: 30,
+      height: 30,
+      borderRadius: 8,
+      border: `1px solid ${C.line2}`,
+      background: C.bg,
+      color: C.dim,
+      fontSize: 16,
+      lineHeight: 1
+    }
+  }, mcqCollapsed ? '\u25C0' : '\u25B6')), /*#__PURE__*/React.createElement("div", {
+    className: "mcq-rail-label"
+  }, "\uC6D0\uBB38 \uAC1D\uAD00\uC2DD"), /*#__PURE__*/React.createElement("div", {
+    className: "mcq-content"
+  }, d.hasMcq && /*#__PURE__*/React.createElement("div", {
     className: "fade",
     style: {
       marginTop: 12,
       display: 'grid',
       gap: 10
     }
-  }, /*#__PURE__*/React.createElement("textarea", {
+  }, /*#__PURE__*/React.createElement("input", {
+    ref: mcqFileRef,
+    type: "file",
+    accept: ".txt,text/plain",
+    style: {
+      display: 'none'
+    },
+    onChange: loadQuickMcqFile
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'grid',
+      gap: 8,
+      padding: 12,
+      border: `1px solid ${C.line}`,
+      borderRadius: 9,
+      background: C.bg
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      flexWrap: 'wrap'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: C.dim,
+      fontWeight: 700
+    }
+  }, "빠른 객관식 입력  # 질문 / + 정답 / - 오답", /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 3,
+      fontSize: 11.5,
+      color: C.faint,
+      fontWeight: 500,
+      lineHeight: 1.5
+    }
+  }, "원문 객관식만 채웁니다. 좌측 Stem/정답/생각 로직은 별도로 작성하세요.")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 7,
+      flexWrap: 'wrap'
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: () => mcqFileRef.current?.click(),
+    style: {
+      background: `${C.teal}12`,
+      color: C.teal,
+      border: `1px solid ${C.teal}55`,
+      borderRadius: 8,
+      padding: '7px 11px',
+      fontSize: 12.5,
+      fontWeight: 700
+    }
+  }, "TXT 불러오기"), /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: () => applyQuickMcq(mcqQuickText),
+    style: {
+      background: `${C.amber}14`,
+      color: C.amber,
+      border: `1px solid ${C.amber}66`,
+      borderRadius: 8,
+      padding: '7px 11px',
+      fontSize: 12.5,
+      fontWeight: 700
+    }
+  }, "아래 내용 적용"))), /*#__PURE__*/React.createElement("textarea", {
+    style: {
+      ...field,
+      minHeight: 120,
+      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+      fontSize: 13
+    },
+    value: mcqQuickText,
+    onChange: e => setMcqQuickText(e.target.value),
+    placeholder: "# 다음 중 이 앱의 개발자는 누구인가요?\n+ 김부건\n- 박근혜\n- 박정희\n- 이승만\n- 대중씨"
+  })), /*#__PURE__*/React.createElement("textarea", {
     style: {
       ...field,
       minHeight: 50
@@ -1604,7 +1978,7 @@ function Capture({
       fontSize: 13,
       width: 'fit-content'
     }
-  }, "+ \uBCF4\uAE30 \uCD94\uAC00"))), /*#__PURE__*/React.createElement("div", {
+  }, "+ \uBCF4\uAE30 \uCD94\uAC00")))), /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'flex',
       gap: 10
@@ -1646,21 +2020,16 @@ function Recall({
   const queue = useMemo(() => interleave(cards.filter(isDue)), [cards]);
   const [i, setI] = useState(0);
   const [revealed, setRevealed] = useState(false);
-  const [retry, setRetry] = useState(false);
-  const [picked, setPicked] = useState(null);
-  const card = queue[i];
-  const shuffled = useMemo(() => {
-    if (!card || !card.originalMcq) return null;
-    return shuffle(card.originalMcq.options.map((text, idx) => ({
-      text,
-      correct: idx === card.originalMcq.answerIndex
-    })));
-  }, [card, retry]);
+  const [originalOpen, setOriginalOpen] = useState(false);
+  const currentIndex = queue.length ? Math.min(i, queue.length - 1) : 0;
+  const card = queue[currentIndex];
+  useEffect(() => {
+    if (queue.length && i !== currentIndex) setI(currentIndex);
+  }, [queue.length, i, currentIndex]);
   useEffect(() => {
     setRevealed(false);
-    setRetry(false);
-    setPicked(null);
-  }, [i]);
+    setOriginalOpen(false);
+  }, [card?.id]);
   const grade = pass => {
     const updated = touchCard(card, {
       srs: schedule(card.srs, pass)
@@ -1669,7 +2038,12 @@ function Recall({
     update(next);
     cloudSave(updated);
     flash(pass ? '✅ 다음 복습 연장' : '❌ 곧 다시 출제');
-    if (i + 1 >= queue.length) setI(0);else setI(i + 1);
+    if (!pass && queue.length > 1) {
+      setI((currentIndex + 1) % queue.length);
+      return;
+    }
+    const remaining = queue.length - 1;
+    if (remaining <= 0 || currentIndex >= remaining) setI(0);else setI(currentIndex);
   };
   if (queue.length === 0) return /*#__PURE__*/React.createElement("div", {
     className: "fade",
@@ -1730,74 +2104,16 @@ function Recall({
       letterSpacing: '.05em',
       textTransform: 'uppercase'
     }
-  }, "\uC778\uCD9C\uD558\uAE30 \xB7 recall this"), !retry ? /*#__PURE__*/React.createElement("div", {
+  }, "\uC778\uCD9C\uD558\uAE30 \xB7 recall this"), /*#__PURE__*/React.createElement("div", {
     className: "serif",
     style: {
       fontSize: 19,
       lineHeight: 1.5
     }
-  }, card.stem) : /*#__PURE__*/React.createElement("div", {
-    className: "fade"
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 15,
-      lineHeight: 1.55,
-      marginBottom: 14
-    }
-  }, card.originalMcq.stemFull), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: 'grid',
-      gap: 8
-    }
-  }, shuffled.map((o, idx) => {
-    const sel = picked === idx;
-    let bd = C.line2,
-      bg = C.bg,
-      fg = C.text;
-    if (revealed && o.correct) {
-      bd = C.green;
-      bg = `${C.green}1f`;
-    } else if (revealed && sel && !o.correct) {
-      bd = C.red;
-      bg = `${C.red}1f`;
-    } else if (sel) {
-      bd = C.amber;
-    }
-    return /*#__PURE__*/React.createElement("button", {
-      key: idx,
-      className: "tap",
-      disabled: revealed,
-      onClick: () => setPicked(idx),
-      style: {
-        textAlign: 'left',
-        display: 'flex',
-        gap: 10,
-        alignItems: 'center',
-        background: bg,
-        color: fg,
-        border: `1px solid ${bd}`,
-        borderRadius: 9,
-        padding: '10px 12px',
-        fontSize: 14
-      }
-    }, /*#__PURE__*/React.createElement("span", {
-      style: {
-        fontWeight: 700,
-        color: C.dim
-      }
-    }, String.fromCharCode(65 + idx)), o.text, revealed && o.correct && /*#__PURE__*/React.createElement("span", {
-      style: {
-        marginLeft: 'auto',
-        color: C.green,
-        fontWeight: 700
-      }
-    }, "\u2713"));
-  }))), card.originalMcq && /*#__PURE__*/React.createElement("button", {
+  }, card.stem), card.originalMcq && /*#__PURE__*/React.createElement("button", {
     className: "tap",
     onClick: () => {
-      setRetry(!retry);
-      setRevealed(false);
-      setPicked(null);
+      setOriginalOpen(true);
     },
     style: {
       marginTop: 14,
@@ -1808,7 +2124,7 @@ function Recall({
       padding: '6px 12px',
       fontSize: 12.5
     }
-  }, retry ? '↩ 추상 트리거로' : '↻ 원문 재시도 (보기 셔플)')), !revealed ? /*#__PURE__*/React.createElement("button", {
+  }, "\uC6D0\uBB38 \uAC1D\uAD00\uC2DD \uBCF4\uAE30"), !revealed ? /*#__PURE__*/React.createElement("button", {
     className: "tap",
     onClick: () => setRevealed(true),
     style: {
@@ -1913,7 +2229,11 @@ function Recall({
       marginTop: 8,
       textAlign: 'center'
     }
-  }, "\uCD9C\uCC98 ", card.source || '—', " \xB7 \uD604\uC7AC \uAC04\uACA9 ", card.srs ? `${card.srs.interval}d` : '신규')));
+  }, "\uCD9C\uCC98 ", card.source || '—', " \xB7 \uD604\uC7AC \uAC04\uACA9 ", card.srs ? `${card.srs.interval}d` : '신규'), originalOpen && /*#__PURE__*/React.createElement(OriginalMcqModal, {
+    card: card,
+    revealed: revealed,
+    onClose: () => setOriginalOpen(false)
+  }))));
 }
 
 /* ============================================================
@@ -2877,8 +3197,9 @@ function Export({
           if (imported.length === 0) throw new Error('유효한 카드 데이터가 없습니다 (id·stem·correct 필드 필요)');
           const skipped = raw.length - imported.length;
           const skipMsg = skipped > 0 ? `<br><span style="color:#f97316;font-size:11px">⚠️ 구조 불일치 ${skipped}개 건너뜀</span>` : '';
-          showConfirm(`JSON에서 ${imported.length}개 카드를 가져올까요?${skipMsg}<br><span style="font-size:11px;color:#64748b">기존 카드와 병합됩니다 (중복 ID는 덮어씁니다)</span>`, () => {
-            const merged = [...imported, ...cards.filter(c => !imported.find(i => i.id === c.id))];
+          const importedClean = normalizeCards(imported);
+          showConfirm(`JSON에서 ${importedClean.length}개 카드를 가져올까요?${skipMsg}<br><span style="font-size:11px;color:#64748b">기존 카드와 병합됩니다 (중복 ID는 updated_at 최신본 기준)</span>`, () => {
+            const merged = mergeByUpdatedAt(cards, importedClean);
             saveStore(merged);
             window.location.reload();
           });
@@ -3009,11 +3330,12 @@ function Settings({
         saveLocalTombstones(cloudAll.filter(card => card.deleted_at));
         if (cloudVersion) saveLocalSyncMeta({ canonical_version: cloudVersion, last_sync_mode: 'manual_pull' });
         flash(`⬇️ ${cloudCards.length}개 카드를 클라우드 기준으로 반영`);
-      });
+        setSbLoading(false);
+      }, () => setSbLoading(false));
     } catch (e) {
       flash('Pull 실패: ' + e.message);
+      setSbLoading(false);
     }
-    setSbLoading(false);
   };
   const disconnectSb = () => {
     showConfirm('Supabase 연결을 해제할까요?<br><span style="font-size:11px;color:#9a9088">로컬 데이터는 유지됩니다</span>', () => {
