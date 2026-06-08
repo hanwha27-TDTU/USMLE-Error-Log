@@ -36,10 +36,6 @@
     }
     input::placeholder, textarea::placeholder { color: #a0aec0; opacity:1; }
     select option { background: #fff; color: #1e293b; }
-    /* ── uwn card lift ── */
-    .card-lift {
-      box-shadow: 0 1px 4px rgba(0,0,0,.07), 0 1px 2px rgba(0,0,0,.04);
-    }
     #confirm-overlay {
       display:none; position:fixed; inset:0; background:rgba(15,22,35,.55);
       z-index:9999; align-items:center; justify-content:center;
@@ -106,6 +102,15 @@
       delete clean.createdAt;
       delete clean.updatedAt;
       delete clean.deletedAt;
+      if (!clean.wrongReason && clean.content_kr) clean.wrongReason = clean.content_kr;
+      delete clean.content_kr;
+      delete clean.content_en;
+      clean.stem = textOf(clean.stem);
+      clean.correct = textOf(clean.correct);
+      clean.myAnswer = textOf(clean.myAnswer);
+      clean.errorType = getErrorType(clean.errorType).id;
+      clean.system = systemOf(clean);
+      if (!Array.isArray(clean.buzzword)) clean.buzzword = textOf(clean.buzzword).split(',').map(s => s.trim()).filter(Boolean);
       if (deleted) clean.deleted_at = deleted; else delete clean.deleted_at;
       return clean;
     }
@@ -214,7 +219,10 @@
               if (!db.objectStoreNames.contains('kv')) { resolve(null); return; }
               try {
                 const r = db.transaction('kv','readonly').objectStore('kv').get('cards');
-                r.onsuccess = () => resolve(r.result ? JSON.parse(r.result) : null);
+                r.onsuccess = () => {
+                  try { resolve(r.result ? JSON.parse(r.result) : null); }
+                  catch { resolve(null); }
+                };
                 r.onerror   = () => resolve(null);
               } catch { resolve(null); }
             };
@@ -372,9 +380,8 @@
     function isClaudeEnv() {
       try {
         return window.location.hostname.includes('claude.ai') ||
-               window.location.hostname.includes('anthropic.com') ||
-               window.parent !== window;
-      } catch { return true; }
+               window.location.hostname.includes('anthropic.com');
+      } catch { return false; }
     }
     async function callClaudeBuiltin(prompt, maxTokens = 1000) {
       const res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -466,7 +473,7 @@
         if (d.output_text) return d.output_text;
         return (d.output || []).flatMap(i => i.content || []).map(c => c.text || '').join('\n');
       }
-      throw new Error('AI API 미설정. 설정 탭에서 API 키를 입력해주세요.');
+      throw new Error('AI API 미설정. 우측 상단 설정 버튼에서 API 키를 입력해주세요.');
     }
     async function aiEnrichCard(stem, correct, myAnswer) {
       const prompt = `You are a USMLE Step 1/Step 2 CK expert. Given this wrong-answer card:
@@ -478,8 +485,8 @@ Generate concise USMLE-style content. Respond ONLY with valid JSON (no markdown,
 {
   "pathophys": "1-2 line mechanism using up/down arrows (↑↓)",
   "trap": "why a student would pick the wrong answer instead of correct one",
-  "content_kr": "한국어 기반 1-2문장 설명. 의학용어는 반드시 '한국어(English)' 병기 형식으로. 예: 신세관(Proximal Tubule) 손상 → 갈색 과립 원주(Muddy Brown Casts) 형성",
-  "content_en": "1-2 sentence English high-yield note",
+  "wrongReason": "한국어 1-2문장. 내가 고른 오답이 왜 틀렸고 정답과 어떤 결정적 차이가 있는지 설명",
+  "nextCue": "다음에 이 문제를 맞히기 위한 한 줄 단서. 예: 고Ca뇨 + loop 부위 + furosemide mimic = Bartter",
   "buzzword": "comma-separated 2-4 USMLE buzzwords"
 }`;
       const raw = await callAI(prompt, 900);
@@ -487,14 +494,6 @@ Generate concise USMLE-style content. Respond ONLY with valid JSON (no markdown,
       const s = clean.indexOf('{'), e = clean.lastIndexOf('}');
       if (s === -1 || e === -1) throw new Error('AI 응답 파싱 실패: JSON을 찾을 수 없음');
       return JSON.parse(clean.slice(s, e + 1));
-    }
-
-    /* ── Export helpers ── */
-    /* Anki TSV cell — 탭·실제 줄바꿈 제거 (열 깨짐 방지) */
-    function cleanTsvCell(v) {
-      return String(v || '')
-        .replace(new RegExp('\t', 'g'), '  ')
-        .replace(new RegExp('\r?\n', 'g'), ' ');
     }
 
     function exportJSON(cards) {
@@ -505,10 +504,10 @@ Generate concise USMLE-style content. Respond ONLY with valid JSON (no markdown,
       const rows = cards.map(c => ({
         'Stem': c.stem, 'My Answer': c.myAnswer, 'Correct': c.correct,
         'Error Type': c.errorType, 'System': c.system,
-        'Pathophys': c.pathophys, 'Trap': c.trap,
+        '기전': c.pathophys, '함정': c.trap,
+        '오답인 이유': wrongReasonOf(c), '다음 단서': nextCueOf(c),
         'Buzzword': (c.buzzword || []).join(', '),
         'Source': c.source, 'Confidence': c.confidence,
-        'KR': c.content_kr, 'EN': c.content_en,
         'SRS Interval': c.srs?.interval || 0, 'Due Date': c.srs?.dueDate || '',
       }));
       const ws = XLSX.utils.json_to_sheet(rows);
@@ -559,7 +558,7 @@ Generate concise USMLE-style content. Respond ONLY with valid JSON (no markdown,
   </script>
 
   <!-- ============================================================
-       REACT COMPONENTS  (Babel JSX)
+       REACT COMPONENTS  (compiled React)
        ============================================================ -->
   <script>
 const {
@@ -604,6 +603,9 @@ const ERROR_TYPES = [{
 }];
 const ET = Object.fromEntries(ERROR_TYPES.map(e => [e.id, e]));
 const SYSTEMS = ['Renal', 'Cardio', 'Pulm', 'GI', 'Heme/Onc', 'Endo', 'Neuro', 'MSK', 'Repro', 'Immuno', 'Micro', 'Pharm', 'Psych', 'Biochem', 'Derm'];
+const getErrorType = id => ET[id] || ET.KNOWLEDGE || ERROR_TYPES[0];
+const textOf = v => String(v || '');
+const systemOf = card => card?.system || 'General';
 
 /* ── SM-2 ── */
 function schedule(srs, pass) {
@@ -637,6 +639,8 @@ const todayStr = () => {
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 };
 const isDue = c => !c.srs || !c.srs.dueDate || c.srs.dueDate <= todayStr();
+const wrongReasonOf = card => card?.wrongReason || '';
+const nextCueOf = card => card?.nextCue || '';
 const uid = () => Math.random().toString(36).slice(2, 10);
 function interleave(cards) {
   const g = {};
@@ -655,14 +659,6 @@ function interleave(cards) {
   }
   return out;
 }
-const shuffle = arr => {
-  const a = arr.slice();
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-};
 function parseQuickMcq(raw) {
   const questions = [];
   let current = null;
@@ -759,11 +755,11 @@ const SEED = [{
   system: 'Renal',
   pathophys: 'NKCC2 ↓ (loop of Henle) → furosemide 흉내 → Na/K/Cl 재흡수 ↓',
   trap: 'Gitelman과 혼동 — Gitelman은 저Ca²⁺뇨 + 저Mg²⁺ (DCT, thiazide 흉내)',
+  wrongReason: 'Gitelman은 DCT의 NCC 결함이라 저Ca²⁺뇨/저Mg²⁺가 핵심입니다. 이 문제는 고Ca²⁺뇨와 loop 부위 단서가 있어 Bartter가 맞습니다.',
+  nextCue: '고Ca²⁺뇨 + loop 부위 + furosemide mimic = Bartter',
   buzzword: ['NKCC2', 'loop-diuretic mimic', 'hypercalciuria'],
   source: 'UWorld',
   confidence: 4,
-  content_kr: '바터 증후군(Bartter Syndrome) = 헨레고리(Loop of Henle) NKCC2 결함. 고칼슘뇨(Hypercalciuria)가 핵심 감별점.',
-  content_en: 'Bartter = NKCC2 defect (loop-diuretic mimic). Hypercalciuria distinguishes from Gitelman.',
   originalMcq: {
     stemFull: 'A 9-year-old has muscle weakness. Labs: K⁺ 2.8, metabolic alkalosis, normal BP, ↑ urine Ca²⁺. The defect is in which transporter?',
     options: ['NKCC2 in the thick ascending limb', 'NCC in the distal convoluted tubule', 'ENaC in the collecting duct', 'Na⁺/K⁺-ATPase', 'Aquaporin-2'],
@@ -779,11 +775,11 @@ const SEED = [{
   system: 'Pulm',
   pathophys: '폐포-모세혈관막 손상 → 투과성 ↑ → 비심인성 폐부종 + compliance ↓',
   trap: '심인성 폐부종과 감별 — ARDS는 PCWP ≤ 18, 정상 심기능',
+  wrongReason: '심인성 폐부종은 심장 기능 저하나 wedge pressure 상승이 핵심입니다. 패혈증 뒤 양측 침윤과 P/F < 300인데 심부전이 아니면 ARDS로 가야 합니다.',
+  nextCue: '패혈증 후 저산소혈증 + 양측 침윤 + 심부전 아님 = ARDS',
   buzzword: ['P/F ratio', 'bilateral infiltrates', 'low compliance', 'Berlin'],
   source: 'NBME',
   confidence: 3,
-  content_kr: '급성호흡곤란증후군(ARDS) = 비심인성 폐부종(Non-cardiogenic Pulmonary Edema). 폐보호 환기(Lung-protective Ventilation, 6 mL/kg) + 호기말양압(PEEP). P/F비 < 300.',
-  content_en: 'ARDS = noncardiogenic. Lung-protective ventilation (6 mL/kg) + PEEP. P/F<300.',
   originalMcq: null,
   srs: null
 }, {
@@ -795,11 +791,11 @@ const SEED = [{
   system: 'Renal',
   pathophys: '허혈/신독소 → 근위세관 괴사 → 원주 형성, 농축능 상실',
   trap: 'Prerenal과 감별 — prerenal은 BUN/Cr >20, FENa <1%, ↑UOsm',
+  wrongReason: 'Prerenal azotemia는 신장 관류 저하라 BUN/Cr > 20, FENa < 1%가 전형적입니다. 신독소 뒤 갈색 과립 원주와 FENa > 2%면 세뇨관 손상인 ATN입니다.',
+  nextCue: '신독소/허혈 + muddy brown casts + FENa > 2% = ATN',
   buzzword: ['muddy brown casts', 'FENa >2%', 'BUN/Cr <20'],
   source: 'UWorld',
   confidence: 2,
-  content_kr: '급성세관괴사(Acute Tubular Necrosis, ATN) = 세관(Tubule) 괴사. 갈색 과립 원주(Muddy Brown Casts), 소변 나트륨 분획 배설(FENa) > 2%. 지지요법.',
-  content_en: 'ATN = tubular necrosis. FENa>2%, muddy-brown casts. Supportive care.',
   originalMcq: null,
   srs: null
 }];
@@ -853,8 +849,6 @@ const gcss = `
       @keyframes fadeUp{from{opacity:0;transform:translateY(5px);}to{opacity:1;transform:none;}}
       .fade{animation:fadeUp .25s ease both;}
       .uwn{background:transparent;}
-      /* light mode helpers */
-      .panel-card{box-shadow:0 1px 4px rgba(0,0,0,.07);}
     `;
 const field = {
   width: '100%',
@@ -1390,6 +1384,73 @@ function DeveloperModal({
   }, updates.map(updateBox)))));
 }
 
+function ToolModal({
+  title,
+  onClose,
+  children
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: 'fixed',
+      inset: 0,
+      zIndex: 9996,
+      background: 'rgba(15,23,42,0.42)',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      padding: 18
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fade",
+    style: {
+      width: 'min(1080px, 100%)',
+      maxHeight: '88vh',
+      overflow: 'auto',
+      background: C.panel,
+      color: C.text,
+      border: `1px solid ${C.line2}`,
+      borderRadius: 14,
+      boxShadow: '0 24px 70px rgba(15,23,42,.28)'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: 'sticky',
+      top: 0,
+      zIndex: 1,
+      background: C.panel,
+      borderBottom: `1px solid ${C.line}`,
+      padding: '14px 16px',
+      display: 'flex',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      gap: 12
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "serif",
+    style: {
+      fontWeight: 700,
+      fontSize: 22,
+      color: C.text
+    }
+  }, title), /*#__PURE__*/React.createElement("button", {
+    className: "tap",
+    onClick: onClose,
+    style: {
+      background: `${C.red}10`,
+      border: `1px solid ${C.red}66`,
+      borderRadius: 8,
+      color: C.red,
+      padding: '7px 12px',
+      fontSize: 12.5,
+      fontWeight: 800
+    }
+  }, "\uB2EB\uAE30")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: 16
+    }
+  }, children)));
+}
+
 /* ============================================================
    APP
    ============================================================ */
@@ -1399,6 +1460,7 @@ function App() {
   const [toast, setToast] = useState('');
   const [txtConverterOpen, setTxtConverterOpen] = useState(false);
   const [developerOpen, setDeveloperOpen] = useState(false);
+  const [toolOpen, setToolOpen] = useState(null);
   useEffect(() => {
     (async () => {
       try {
@@ -1406,14 +1468,15 @@ function App() {
         let data = loadStore();
         /* 2. fallback: try migrate from IndexedDB with timeout */
         if (!data) data = await migrateFromIDB();
-        if (Array.isArray(data)) {
-          const clean = normalizeCards(data);
-          setCards(clean);
-          saveStore(clean);
-        } else {
-          const seed = normalizeCards(SEED);
-          setCards(seed);
-          saveStore(seed);
+        const initial = Array.isArray(data) ? normalizeCards(data) : normalizeCards(SEED);
+        setCards(initial);
+        saveStore(initial);
+        if (getSbCfg()) {
+          sbAutoSync(initial).then(synced => {
+            setCards(synced.cards);
+            saveStore(synced.cards);
+            showGlobalToast(synced.mode === 'canonical_pull' ? '클라우드 최종본 반영' : '자동 동기화 완료');
+          }).catch(e => console.warn('Startup sync failed:', e.message));
         }
       } catch(e) {
         /* 어떤 오류가 발생해도 SEED로 fallback — 절대 멈추지 않음 */
@@ -1529,16 +1592,16 @@ function App() {
     }
   }, /*#__PURE__*/React.createElement("button", {
     className: "tap",
-    onClick: () => setView('dashboard'),
-    style: topBtn(C.green, view === 'dashboard')
+    onClick: () => setToolOpen('dashboard'),
+    style: topBtn(C.green, toolOpen === 'dashboard')
   }, "\uD1B5\uACC4"), /*#__PURE__*/React.createElement("button", {
     className: "tap",
-    onClick: () => setView('export'),
-    style: topBtn(C.teal, view === 'export')
+    onClick: () => setToolOpen('export'),
+    style: topBtn(C.teal, toolOpen === 'export')
   }, "\uB370\uC774\uD130 \uAD00\uB9AC"), /*#__PURE__*/React.createElement("button", {
     className: "tap",
-    onClick: () => setView('settings'),
-    style: topBtn(C.dim, view === 'settings')
+    onClick: () => setToolOpen('settings'),
+    style: topBtn(C.dim, toolOpen === 'settings')
   }, "\uC124\uC815"), /*#__PURE__*/React.createElement("button", {
     className: "tap",
     onClick: () => setTxtConverterOpen(true),
@@ -1547,17 +1610,7 @@ function App() {
     className: "tap",
     onClick: () => setDeveloperOpen(true),
     style: topBtn(C.amber)
-  }, "\uAC1C\uBC1C\uC790"), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
-    style: {
-      color: C.text,
-      fontWeight: 600
-    }
-  }, cards.length), " cards \xB7", ' ', /*#__PURE__*/React.createElement("span", {
-    style: {
-      color: dueCount ? C.amber : C.dim,
-      fontWeight: 600
-    }
-  }, dueCount), " due"))), /*#__PURE__*/React.createElement("div", {
+  }, "\uAC1C\uBC1C\uC790"))), /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'flex',
       gap: 4,
@@ -1616,13 +1669,16 @@ function App() {
     cards: cards,
     update: update,
     flash: flash
-  }), view === 'dashboard' && /*#__PURE__*/React.createElement(Dashboard, {
+  })), toolOpen && /*#__PURE__*/React.createElement(ToolModal, {
+    title: toolOpen === 'dashboard' ? '\uD1B5\uACC4' : toolOpen === 'export' ? '\uB370\uC774\uD130 \uAD00\uB9AC' : '\uC124\uC815',
+    onClose: () => setToolOpen(null)
+  }, toolOpen === 'dashboard' && /*#__PURE__*/React.createElement(Dashboard, {
     cards: cards
-  }), view === 'export' && /*#__PURE__*/React.createElement(Export, {
+  }), toolOpen === 'export' && /*#__PURE__*/React.createElement(Export, {
     cards: cards,
     update: update,
     flash: flash
-  }), view === 'settings' && /*#__PURE__*/React.createElement(Settings, {
+  }), toolOpen === 'settings' && /*#__PURE__*/React.createElement(Settings, {
     cards: cards,
     update: update,
     flash: flash
@@ -1659,11 +1715,11 @@ const emptyDraft = () => ({
   system: 'Renal',
   pathophys: '',
   trap: '',
+  wrongReason: '',
+  nextCue: '',
   buzzword: '',
   source: '',
   confidence: 3,
-  content_kr: '',
-  content_en: '',
   hasMcq: false,
   mcqStem: '',
   mcqOptions: ['', '', '', ''],
@@ -1724,8 +1780,8 @@ function Capture({
         ...p,
         pathophys: r.pathophys || p.pathophys,
         trap: r.trap || p.trap,
-        content_kr: r.content_kr || p.content_kr,
-        content_en: r.content_en || p.content_en,
+        wrongReason: r.wrongReason || p.wrongReason,
+        nextCue: r.nextCue || p.nextCue,
         buzzword: r.buzzword || p.buzzword
       }));
       flash('✨ AI 자동완성 완료');
@@ -1749,11 +1805,11 @@ function Capture({
       system: d.system,
       pathophys: d.pathophys.trim(),
       trap: d.trap.trim(),
+      wrongReason: d.wrongReason.trim(),
+      nextCue: d.nextCue.trim(),
       buzzword: d.buzzword.split(',').map(s => s.trim()).filter(Boolean),
       source: d.source.trim(),
       confidence: d.confidence,
-      content_kr: d.content_kr.trim(),
-          content_en: d.content_en.trim(),
       originalMcq: d.hasMcq ? {
         stemFull: d.mcqStem.trim(),
         options: d.mcqOptions.map(o => o.trim()).filter(Boolean),
@@ -1869,7 +1925,7 @@ function Capture({
       ...lbl,
       marginBottom: 0
     }
-  }, "\uAE30\uC804 / \uD568\uC815 / \uD2B8\uB9B4\uB9C1\uAD6C\uC5BC \uD574\uC124"), /*#__PURE__*/React.createElement("button", {
+  }, "\uAE30\uC804 / \uD568\uC815 / \uC624\uB2F5\uC778 \uC774\uC720 / \uB2E4\uC74C \uB2E8\uC11C"), /*#__PURE__*/React.createElement("button", {
     className: "tap",
     onClick: aiAutofill,
     disabled: aiLoading,
@@ -1903,34 +1959,22 @@ function Capture({
     value: d.trap,
     onChange: e => set('trap', e.target.value),
     placeholder: "\uD568\uC815 (Trap \xB7 distractor\uAC00 \uC18D\uC778 \uC774\uC720)"
-  }))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      borderTop: `1px solid ${C.line}`,
-      paddingTop: 12
-    }
-  }, /*#__PURE__*/React.createElement("label", {
-    style: lbl
-  }, "\uD2B8\uB9B4\uB9C1\uAD6C\uC5BC \uD574\uC124 (KR / EN)"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: 'grid',
-      gap: 8
-    }
-  }, /*#__PURE__*/React.createElement("textarea", {
-    style: {
-      ...field,
-      minHeight: 72
-    },
-    value: d.content_kr,
-    onChange: e => set('content_kr', e.target.value),
-    placeholder: "\uD83C\uDDF0\uD83C\uDDF7 \uD55C\uAD6D\uC5B4 \uD574\uC124"
   }), /*#__PURE__*/React.createElement("textarea", {
     style: {
       ...field,
       minHeight: 72
     },
-    value: d.content_en,
-    onChange: e => set('content_en', e.target.value),
-    placeholder: "\uD83C\uDDEC\uD83C\uDDE7 English note"
+    value: d.wrongReason,
+    onChange: e => set('wrongReason', e.target.value),
+    placeholder: "\uC624\uB2F5\uC778 \uC774\uC720 (\uB0B4\uAC00 \uACE0\uB978 \uB2F5\uC774 \uC65C \uD2C0\uB838\uB294\uC9C0)"
+  }), /*#__PURE__*/React.createElement("textarea", {
+    style: {
+      ...field,
+      minHeight: 56
+    },
+    value: d.nextCue,
+    onChange: e => set('nextCue', e.target.value),
+    placeholder: "\uB2E4\uC74C \uB2E8\uC11C (\uB2E4\uC74C\uC5D0 \uC774 \uBB38\uC81C\uB97C \uB9DE\uD788\uAE30 \uC704\uD55C 1\uC904)"
   }))), /*#__PURE__*/React.createElement("div", {
     style: two
   }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
@@ -2243,7 +2287,7 @@ function Recall({
       fontSize: 14
     }
   }, "\uBAA8\uB4E0 due \uCE74\uB4DC\uB97C \uC778\uCD9C\uD588\uC5B4\uC694. \uC0C8 \uC624\uB2F5\uC744 \uCEA1\uCC98\uD558\uAC70\uB098 \uB0B4\uC77C \uB2E4\uC2DC \uC624\uC138\uC694."));
-  const et = ET[card.errorType];
+  const et = getErrorType(card.errorType);
   return /*#__PURE__*/React.createElement("div", {
     className: "fade"
   }, /*#__PURE__*/React.createElement("div", {
@@ -2342,6 +2386,14 @@ function Recall({
     k: "\uD568\uC815 \xB7 Trap",
     v: card.trap,
     color: C.amber
+  }), wrongReasonOf(card) && /*#__PURE__*/React.createElement(Row, {
+    k: "\uC624\uB2F5\uC778 \uC774\uC720",
+    v: wrongReasonOf(card),
+    color: C.red
+  }), nextCueOf(card) && /*#__PURE__*/React.createElement(Row, {
+    k: "\uB2E4\uC74C \uB2E8\uC11C",
+    v: nextCueOf(card),
+    color: C.teal
   }), card.buzzword?.length > 0 && /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'flex',
@@ -2352,24 +2404,7 @@ function Recall({
   }, card.buzzword.map((b, k) => /*#__PURE__*/React.createElement(Badge, {
     key: k,
     color: C.teal
-  }, b))), (card.content_kr || card.content_en) && /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginTop: 12,
-      borderTop: `1px solid ${C.line}`,
-      paddingTop: 10,
-      display: 'grid',
-      gap: 6,
-      fontSize: 13.5
-    }
-  }, card.content_kr && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
-    style: {
-      color: C.faint
-    }
-  }, "\uD83C\uDDF0\uD83C\uDDF7 "), card.content_kr), card.content_en && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
-    style: {
-      color: C.faint
-    }
-  }, "\uD83C\uDDEC\uD83C\uDDE7 "), card.content_en)), /*#__PURE__*/React.createElement("div", {
+  }, b))), /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'flex',
       gap: 10,
@@ -2440,13 +2475,13 @@ function Library({
     let list = cards;
     if (search.trim()) {
       const q = search.toLowerCase();
-      list = list.filter(c => c.stem.toLowerCase().includes(q) || c.correct.toLowerCase().includes(q) || (c.trap || '').toLowerCase().includes(q) || (c.buzzword || []).some(b => b.toLowerCase().includes(q)));
+      list = list.filter(c => textOf(c.stem).toLowerCase().includes(q) || textOf(c.correct).toLowerCase().includes(q) || textOf(c.trap).toLowerCase().includes(q) || wrongReasonOf(c).toLowerCase().includes(q) || nextCueOf(c).toLowerCase().includes(q) || (Array.isArray(c.buzzword) ? c.buzzword : []).some(b => textOf(b).toLowerCase().includes(q)));
     }
     if (sysFilter) list = list.filter(c => c.system === sysFilter);
     if (etFilter) list = list.filter(c => c.errorType === etFilter);
     if (dueOnly) list = list.filter(isDue);
     if (sort === 'dueDate') list = list.slice().sort((a, b) => (a.srs?.dueDate || '0') < (b.srs?.dueDate || '0') ? -1 : 1);
-    if (sort === 'system') list = list.slice().sort((a, b) => a.system.localeCompare(b.system));
+    if (sort === 'system') list = list.slice().sort((a, b) => systemOf(a).localeCompare(systemOf(b)));
     if (sort === 'confidence') list = list.slice().sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
     return list;
   }, [cards, search, sysFilter, etFilter, dueOnly, sort]);
@@ -2470,11 +2505,11 @@ function Library({
       system: card.system,
       pathophys: card.pathophys || '',
       trap: card.trap || '',
+      wrongReason: wrongReasonOf(card),
+      nextCue: nextCueOf(card),
       buzzword: (card.buzzword || []).join(', '),
       source: card.source || '',
       confidence: card.confidence || 3,
-      content_kr: card.content_kr || '',
-      content_en: card.content_en || '',
       hasMcq: !!card.originalMcq,
       mcqStem: card.originalMcq?.stemFull || '',
       mcqOptions: card.originalMcq?.options?.length ? [...card.originalMcq.options] : ['', '', '', ''],
@@ -2495,8 +2530,8 @@ function Library({
         ...p,
         pathophys: r.pathophys || p.pathophys,
         trap: r.trap || p.trap,
-        content_kr: r.content_kr || p.content_kr,
-        content_en: r.content_en || p.content_en,
+        wrongReason: r.wrongReason || p.wrongReason,
+        nextCue: r.nextCue || p.nextCue,
         buzzword: r.buzzword || p.buzzword
       }));
       flash('✨ AI 자동완성 완료');
@@ -2517,11 +2552,11 @@ function Library({
       system: d.system,
       pathophys: d.pathophys.trim(),
       trap: d.trap.trim(),
+      wrongReason: d.wrongReason.trim(),
+      nextCue: d.nextCue.trim(),
       buzzword: d.buzzword.split(',').map(s => s.trim()).filter(Boolean),
       source: d.source.trim(),
       confidence: d.confidence,
-      content_kr: d.content_kr.trim(),
-          content_en: d.content_en.trim(),
       originalMcq: d.hasMcq ? {
         stemFull: d.mcqStem.trim(),
         options: d.mcqOptions.map(o => o.trim()).filter(Boolean),
@@ -2662,7 +2697,7 @@ function Library({
       gap: 6
     }
   }, filtered.map(c => {
-    const et = ET[c.errorType],
+    const et = getErrorType(c.errorType),
       due = isDue(c),
       isExp = expanded === c.id,
       isEd = editing === c.id;
@@ -2704,7 +2739,7 @@ function Library({
         textOverflow: 'ellipsis',
         whiteSpace: isExp ? 'normal' : 'nowrap'
       }
-    }, c.stem), /*#__PURE__*/React.createElement("div", {
+    }, textOf(c.stem)), /*#__PURE__*/React.createElement("div", {
       style: {
         fontSize: 12,
         color: C.dim,
@@ -2719,7 +2754,7 @@ function Library({
         color: C.teal,
         fontWeight: 600
       }
-    }, c.system), /*#__PURE__*/React.createElement("span", {
+    }, systemOf(c)), /*#__PURE__*/React.createElement("span", {
       style: {
         color: et.color
       }
@@ -2728,7 +2763,7 @@ function Library({
         color: C.green,
         fontWeight: 500
       }
-    }, "\u2192 ", c.correct), c.confidence >= 4 && /*#__PURE__*/React.createElement("span", {
+    }, "\u2192 ", textOf(c.correct)), c.confidence >= 4 && /*#__PURE__*/React.createElement("span", {
       style: {
         color: C.red,
         fontSize: 11
@@ -2808,6 +2843,14 @@ function Library({
       k: "\uD568\uC815",
       v: c.trap,
       color: C.amber
+    }), /*#__PURE__*/React.createElement(DetailRow, {
+      k: "\uC624\uB2F5\uC778 \uC774\uC720",
+      v: wrongReasonOf(c),
+      color: C.red
+    }), /*#__PURE__*/React.createElement(DetailRow, {
+      k: "\uB2E4\uC74C \uB2E8\uC11C",
+      v: nextCueOf(c),
+      color: C.teal
     }), c.buzzword?.length > 0 && /*#__PURE__*/React.createElement("div", {
       style: {
         display: 'flex',
@@ -2818,24 +2861,7 @@ function Library({
     }, c.buzzword.map((b, i) => /*#__PURE__*/React.createElement(Badge, {
       key: i,
       color: C.teal
-    }, b))), (c.content_kr || c.content_en) && /*#__PURE__*/React.createElement("div", {
-      style: {
-        borderTop: `1px solid ${C.line}`,
-        paddingTop: 8,
-        marginTop: 4,
-        display: 'grid',
-        gap: 5,
-        fontSize: 13
-      }
-    }, c.content_kr && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
-      style: {
-        color: C.faint
-      }
-    }, "\uD83C\uDDF0\uD83C\uDDF7 "), c.content_kr), c.content_en && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
-      style: {
-        color: C.faint
-      }
-    }, "\uD83C\uDDEC\uD83C\uDDE7 "), c.content_en)), /*#__PURE__*/React.createElement("div", {
+    }, b))), /*#__PURE__*/React.createElement("div", {
       style: {
         fontSize: 11.5,
         color: C.faint,
@@ -2975,6 +3001,24 @@ function Library({
       },
       value: editDraft.trap,
       onChange: e => setED('trap', e.target.value)
+    })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+      style: lbl
+    }, "\uC624\uB2F5\uC778 \uC774\uC720"), /*#__PURE__*/React.createElement("textarea", {
+      style: {
+        ...field,
+        minHeight: 72
+      },
+      value: editDraft.wrongReason,
+      onChange: e => setED('wrongReason', e.target.value)
+    }), /*#__PURE__*/React.createElement("textarea", {
+      style: {
+        ...field,
+        minHeight: 56,
+        marginTop: 7
+      },
+      value: editDraft.nextCue,
+      onChange: e => setED('nextCue', e.target.value),
+      placeholder: "\uB2E4\uC74C \uB2E8\uC11C"
     })), /*#__PURE__*/React.createElement("div", {
       style: {
         display: 'grid',
@@ -2993,34 +3037,6 @@ function Library({
       style: field,
       value: editDraft.source,
       onChange: e => setED('source', e.target.value)
-    }))), /*#__PURE__*/React.createElement("div", {
-      style: {
-        borderTop: `1px solid ${C.line}`,
-        paddingTop: 10
-      }
-    }, /*#__PURE__*/React.createElement("label", {
-      style: lbl
-    }, "\uD2B8\uB9B4\uB9C1\uAD6C\uC5BC \uD574\uC124"), /*#__PURE__*/React.createElement("div", {
-      style: {
-        display: 'grid',
-        gap: 7
-      }
-    }, /*#__PURE__*/React.createElement("textarea", {
-      style: {
-        ...field,
-        minHeight: 72
-      },
-      value: editDraft.content_kr,
-      onChange: e => setED('content_kr', e.target.value),
-      placeholder: "\uD83C\uDDF0\uD83C\uDDF7 \uD55C\uAD6D\uC5B4"
-    }), /*#__PURE__*/React.createElement("textarea", {
-      style: {
-        ...field,
-        minHeight: 72
-      },
-      value: editDraft.content_en,
-      onChange: e => setED('content_en', e.target.value),
-      placeholder: "\uD83C\uDDEC\uD83C\uDDE7 English"
     }))), /*#__PURE__*/React.createElement("div", {
       style: {
         display: 'flex',
@@ -3223,6 +3239,7 @@ function Dashboard({
    ============================================================ */
 function Export({
   cards,
+  update,
   flash
 }) {
   const taRef = useRef(null);
@@ -3231,7 +3248,7 @@ function Export({
   const [importMode, setImportMode] = useState(false);
   const tsv = useMemo(() => cards.map(c => {
     const _ct=v=>String(v||'').replace(/\t/g,'  ').replace(/\r?\n/g,' ');
-    const back=[_ct(c.correct),c.pathophys&&`Pathophys: ${_ct(c.pathophys)}`,c.trap&&`Trap: ${_ct(c.trap)}`,c.buzzword?.length&&`Buzz: ${_ct(c.buzzword.join(', '))}`,c.content_kr&&`[KR] ${_ct(c.content_kr)}`,c.content_en&&`[EN] ${_ct(c.content_en)}`].filter(Boolean).join('\\n');
+    const back=[_ct(c.correct),c.pathophys&&`기전: ${_ct(c.pathophys)}`,c.trap&&`함정: ${_ct(c.trap)}`,wrongReasonOf(c)&&`오답인 이유: ${_ct(wrongReasonOf(c))}`,nextCueOf(c)&&`다음 단서: ${_ct(nextCueOf(c))}`,c.buzzword?.length&&`Buzz: ${_ct(c.buzzword.join(', '))}`].filter(Boolean).join('\\n');
     return `${_ct(c.stem)}	${back}`;
   }).join('\n'), [cards]);
   const copy = async () => {
@@ -3336,7 +3353,7 @@ function Export({
       padding: '1px 5px',
       borderRadius: 4
     }
-  }, '\\n'), " \xB7 [KR][EN] \uD3EC\uD568")), /*#__PURE__*/React.createElement("div", {
+  }, '\\n'), " \xB7 \uAE30\uC804/\uD568\uC815/\uC624\uB2F5\uC774\uC720/\uB2E4\uC74C\uB2E8\uC11C \uD3EC\uD568")), /*#__PURE__*/React.createElement("div", {
     style: {
       borderTop: `1px solid ${C.line}`,
       paddingTop: 14
@@ -3377,10 +3394,18 @@ function Export({
           const skipped = raw.length - imported.length;
           const skipMsg = skipped > 0 ? `<br><span style="color:#f97316;font-size:11px">⚠️ 구조 불일치 ${skipped}개 건너뜀</span>` : '';
           const importedClean = normalizeCards(imported);
-          showConfirm(`JSON에서 ${importedClean.length}개 카드를 가져올까요?${skipMsg}<br><span style="font-size:11px;color:#64748b">기존 카드와 병합됩니다 (중복 ID는 updated_at 최신본 기준)</span>`, () => {
+          showConfirm(`JSON에서 ${importedClean.length}개 카드를 가져올까요?${skipMsg}<br><span style="font-size:11px;color:#64748b">기존 카드와 병합됩니다 (중복 ID는 updated_at 최신본 기준)</span>`, async () => {
             const merged = mergeByUpdatedAt(cards, importedClean);
-            saveStore(merged);
-            window.location.reload();
+            update(merged);
+            flash(`JSON 가져오기 완료 · ${merged.length}개 카드`);
+            if (getSbCfg()) {
+              try {
+                await sbPushAll(merged);
+                flash(`JSON 가져오기 및 클라우드 반영 완료 · ${merged.length}개 카드`);
+              } catch (e) {
+                flash('가져오기는 완료 · 클라우드 반영 실패: ' + e.message);
+              }
+            }
           });
         } catch (err) {
           flash('JSON 파싱 오류: ' + err.message);
