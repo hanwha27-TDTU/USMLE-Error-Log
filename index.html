@@ -82,13 +82,25 @@
     const TOMBSTONE_KEY = 'usmle_deleted_tombstones_v1';
     const CARD_TABLE = 'usmle_cards';
     const SYNC_META_TABLE = 'language_sync_meta';
+    const CANONICAL_META_KEY = 'usmle_cards_canonical_version';
+    const LEGACY_CANONICAL_META_KEY = 'canonical_version';
+    const UPSERT_CHUNK_SIZE = 500;
 
     const nowIso = () => new Date().toISOString();
     const canonicalStamp = () => `${nowIso()}-${Math.random().toString(36).slice(2, 10)}`;
+    const backupStamp = () => new Date().toISOString().replace(/[:.]/g, '-');
     const toMs = v => {
       const ms = Date.parse(v || '');
       return Number.isFinite(ms) ? ms : 0;
     };
+    function buzzwordText(value) {
+      return Array.isArray(value)
+        ? value.map(v => String(v || '').trim()).filter(Boolean).join(', ')
+        : String(value || '');
+    }
+    function parseBuzzwordInput(value) {
+      return buzzwordText(value).split(',').map(s => s.trim()).filter(Boolean);
+    }
     function ensureCardMeta(card, fallbackIso = nowIso()) {
       const created = card.created_at || card.createdAt || card.updated_at || card.updatedAt || fallbackIso;
       const updated = card.updated_at || card.updatedAt || created || fallbackIso;
@@ -110,7 +122,7 @@
       clean.myAnswer = textOf(clean.myAnswer);
       clean.errorType = getErrorType(clean.errorType).id;
       clean.system = systemOf(clean);
-      if (!Array.isArray(clean.buzzword)) clean.buzzword = textOf(clean.buzzword).split(',').map(s => s.trim()).filter(Boolean);
+      clean.buzzword = parseBuzzwordInput(clean.buzzword);
       if (deleted) clean.deleted_at = deleted; else delete clean.deleted_at;
       return clean;
     }
@@ -160,11 +172,41 @@
       try { return JSON.parse(localStorage.getItem(SYNC_META_KEY)) || {}; } catch { return {}; }
     }
     function saveLocalSyncMeta(meta) {
-      localStorage.setItem(SYNC_META_KEY, JSON.stringify({
+      const next = {
         ...getLocalSyncMeta(),
         ...meta,
         checked_at: nowIso()
-      }));
+      };
+      Object.keys(meta || {}).forEach(key => {
+        if (meta[key] === null || meta[key] === undefined) delete next[key];
+      });
+      localStorage.setItem(SYNC_META_KEY, JSON.stringify(next));
+      return next;
+    }
+    function getPendingCanonicalMeta() {
+      const meta = getLocalSyncMeta();
+      return {
+        version: meta.pending_canonical_version || '',
+        status: meta.pending_canonical_status || '',
+        at: meta.pending_canonical_at || '',
+        count: Number(meta.pending_canonical_count || 0)
+      };
+    }
+    function setPendingCanonical(version, count) {
+      saveLocalSyncMeta({
+        pending_canonical_version: version,
+        pending_canonical_status: 'uploading',
+        pending_canonical_at: nowIso(),
+        pending_canonical_count: count
+      });
+    }
+    function clearPendingCanonical() {
+      saveLocalSyncMeta({
+        pending_canonical_version: null,
+        pending_canonical_status: null,
+        pending_canonical_at: null,
+        pending_canonical_count: null
+      });
     }
     function loadLocalTombstones() {
       try {
@@ -237,7 +279,7 @@
       try { return JSON.parse(localStorage.getItem(SB_CFG_KEY)); } catch { return null; }
     }
     function saveSbCfg(url, key) {
-      localStorage.setItem(SB_CFG_KEY, JSON.stringify({ url: url.replace(/\/$/, ''), key }));
+      localStorage.setItem(SB_CFG_KEY, JSON.stringify({ url: url.replace(/\/+$/, ''), key }));
     }
     function sbHdrs(extra = {}) {
       const cfg = getSbCfg();
@@ -260,14 +302,23 @@
       };
     }
     async function sbUpsertRows(rows) {
-      const cfg = getSbCfg(); if (!cfg || rows.length === 0) return 0;
-      const res = await fetch(`${cfg.url}/rest/v1/${CARD_TABLE}`, {
-        method: 'POST',
-        headers: sbHdrs({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
-        body: JSON.stringify(rows)
-      });
-      if (!res.ok) throw new Error(`Upsert 실패: ${res.status} — ${await res.text()}`);
-      return rows.length;
+      const cleanRows = (Array.isArray(rows) ? rows : []).filter(Boolean);
+      const cfg = getSbCfg(); if (!cfg || cleanRows.length === 0) return 0;
+      let saved = 0;
+      for (let i = 0; i < cleanRows.length; i += UPSERT_CHUNK_SIZE) {
+        const chunk = cleanRows.slice(i, i + UPSERT_CHUNK_SIZE);
+        const res = await fetch(`${cfg.url}/rest/v1/${CARD_TABLE}`, {
+          method: 'POST',
+          headers: sbHdrs({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+          body: JSON.stringify(chunk)
+        });
+        if (!res.ok) {
+          const detail = await res.text();
+          throw new Error(`Upsert 실패(${i + 1}-${i + chunk.length}/${cleanRows.length}): ${res.status} — ${detail}`);
+        }
+        saved += chunk.length;
+      }
+      return saved;
     }
     async function sbGetMeta(key) {
       const cfg = getSbCfg(); if (!cfg) return null;
@@ -289,23 +340,40 @@
       if (!res.ok) throw new Error(`메타 저장 실패: ${res.status} — ${await res.text()}`);
       return value;
     }
+    async function sbGetCanonicalVersion(hasCloudCards = true) {
+      const appVersion = await sbGetMeta(CANONICAL_META_KEY);
+      if (appVersion) return appVersion;
+      if (!hasCloudCards) return null;
+      const legacyVersion = await sbGetMeta(LEGACY_CANONICAL_META_KEY).catch(() => null);
+      if (legacyVersion) await sbSetMeta(CANONICAL_META_KEY, legacyVersion).catch(() => {});
+      return legacyVersion;
+    }
+    async function sbSetCanonicalVersion(value) {
+      return await sbSetMeta(CANONICAL_META_KEY, value);
+    }
     async function sbUpsert(card) {
       const cfg = getSbCfg(); if (!cfg) return;
       await sbUpsertRows([cardToRow(card)]);
     }
-    async function sbDelete(id) {
+    async function sbDelete(id, existing = null) {
+      const tombstone = addLocalTombstone(id, existing);
       const cfg = getSbCfg(); if (!cfg) return;
-      const tombstone = addLocalTombstone(id);
       await sbUpsertRows([cardToRow(tombstone)]);
     }
     async function sbLoadAll({ includeDeleted = false } = {}) {
       const cfg = getSbCfg(); if (!cfg) return null;
-      const res = await fetch(
-        `${cfg.url}/rest/v1/${CARD_TABLE}?select=id,created_at,updated_at,deleted_at,data&order=updated_at.desc&limit=5000`,
-        { headers: sbHdrs() }
-      );
-      if (!res.ok) throw new Error(`Supabase ${res.status}: ${await res.text()}`);
-      const rows = await res.json();
+      const rows = [];
+      const pageSize = 1000;
+      for (let offset = 0; ; offset += pageSize) {
+        const res = await fetch(
+          `${cfg.url}/rest/v1/${CARD_TABLE}?select=id,created_at,updated_at,deleted_at,data&order=updated_at.desc&limit=${pageSize}&offset=${offset}`,
+          { headers: sbHdrs() }
+        );
+        if (!res.ok) throw new Error(`Supabase ${res.status}: ${await res.text()}`);
+        const page = await res.json();
+        rows.push(...page);
+        if (page.length < pageSize) break;
+      }
       return normalizeCards(rows.map(row => {
         let data = {};
         try { data = row.data ? JSON.parse(row.data) : {}; } catch { data = {}; }
@@ -321,17 +389,27 @@
     async function sbPushAll(cards, { canonical = false } = {}) {
       const cfg = getSbCfg(); if (!cfg) return 0;
       const clean = normalizeCards(cards);
-      await sbUpsertRows(clean.map(cardToRow));
       if (canonical) {
+        const version = canonicalStamp();
+        setPendingCanonical(version, clean.length);
+        await sbUpsertRows(clean.map(cardToRow));
         const keep = new Set(clean.map(card => card.id));
         const cloudAll = await sbLoadAll({ includeDeleted: true }) || [];
-        const tombstones = cloudAll
+        const newTombstoneRows = cloudAll
           .filter(card => !card.deleted_at && !keep.has(card.id))
           .map(card => cardToRow(makeTombstone(card.id, card)));
-        await sbUpsertRows(tombstones);
-        saveLocalTombstones(tombstones.map(row => JSON.parse(row.data)));
-        const version = await sbSetMeta('canonical_version', canonicalStamp());
+        await sbUpsertRows(newTombstoneRows);
+        const tombstones = normalizeCards([
+          ...cloudAll.filter(card => card.deleted_at),
+          ...newTombstoneRows.map(row => JSON.parse(row.data))
+        ], { includeDeleted: true }).filter(card => card.deleted_at);
+        saveLocalTombstones(tombstones);
+        await sbSetCanonicalVersion(version);
+        clearPendingCanonical();
         saveLocalSyncMeta({ canonical_version: version, last_sync_mode: 'canonical_push' });
+      } else {
+        const localAll = normalizeCards([...clean, ...loadLocalTombstones()], { includeDeleted: true });
+        await sbUpsertRows(localAll.map(cardToRow));
       }
       return clean.length;
     }
@@ -350,9 +428,19 @@
       return true;
     }
     async function sbAutoSync(localCards) {
-      const cloudVersion = await sbGetMeta('canonical_version');
-      const localMeta = getLocalSyncMeta();
       const cloudCards = await sbLoadAll({ includeDeleted: true }) || [];
+      const cloudVersion = await sbGetCanonicalVersion(cloudCards.length > 0);
+      let localMeta = getLocalSyncMeta();
+      const pending = getPendingCanonicalMeta();
+      if (pending.version) {
+        if (cloudVersion && cloudVersion === pending.version) {
+          clearPendingCanonical();
+          localMeta = saveLocalSyncMeta({ canonical_version: cloudVersion, last_sync_mode: 'pending_confirmed' });
+        } else {
+          const visible = normalizeCards(localCards);
+          return { cards: visible, mode: 'pending_blocked', count: visible.length, pending_version: pending.version };
+        }
+      }
       if (cloudVersion && cloudVersion !== localMeta.canonical_version) {
         const cloudVisible = normalizeCards(cloudCards);
         saveLocalTombstones(cloudCards.filter(card => card.deleted_at));
@@ -362,18 +450,39 @@
       const localAll = normalizeCards([...localCards, ...loadLocalTombstones()], { includeDeleted: true });
       const mergedAll = mergeByUpdatedAt(localAll, cloudCards, { includeDeleted: true });
       const mergedVisible = normalizeCards(mergedAll);
+      const initialVersion = cloudVersion ? null : canonicalStamp();
+      if (initialVersion) setPendingCanonical(initialVersion, mergedVisible.length);
       await sbUpsertRows(mergedAll.map(cardToRow));
       saveLocalTombstones(mergedAll.filter(card => card.deleted_at));
-      if (cloudVersion) saveLocalSyncMeta({ canonical_version: cloudVersion, last_sync_mode: 'merge' });
-      return { cards: mergedVisible, mode: 'merge', count: mergedVisible.length };
+      if (cloudVersion) {
+        saveLocalSyncMeta({ canonical_version: cloudVersion, last_sync_mode: 'merge' });
+        return { cards: mergedVisible, mode: 'merge', count: mergedVisible.length };
+      }
+      const version = await sbSetCanonicalVersion(initialVersion);
+      clearPendingCanonical();
+      saveLocalSyncMeta({ canonical_version: version, last_sync_mode: 'initial_canonical' });
+      return { cards: mergedVisible, mode: 'initial_canonical', count: mergedVisible.length };
     }
     function cloudSave(card) {
       if (!getSbCfg()) return;
       sbUpsert(card).catch(e => console.warn('Cloud save failed:', e.message));
     }
-    function cloudDel(id) {
-      if (!getSbCfg()) return;
-      sbDelete(id).catch(e => console.warn('Cloud delete failed:', e.message));
+    function cloudDel(id, existing = null) {
+      sbDelete(id, existing).catch(e => console.warn('Cloud delete failed:', e.message));
+    }
+    function syncModeLabel(mode) {
+      if (mode === 'canonical_pull') return '클라우드 최종본 반영';
+      if (mode === 'initial_canonical') return '초기 기준본 생성';
+      if (mode === 'pending_blocked') return '보류 중인 최종본 확인 필요';
+      if (mode === 'pending_confirmed') return '보류 최종본 확인 완료';
+      return '자동 동기화 완료';
+    }
+    function syncStatusLine(result) {
+      if (result?.mode === 'pending_blocked') return `⚠️ ${syncModeLabel(result.mode)}`;
+      return `✅ ${syncModeLabel(result?.mode)}`;
+    }
+    function syncToastMessage(result) {
+      return `${syncModeLabel(result?.mode)} · ${result?.count ?? 0}개`;
     }
 
     /* ── AI ── */
@@ -496,9 +605,29 @@ Generate concise USMLE-style content. Respond ONLY with valid JSON (no markdown,
       return JSON.parse(clean.slice(s, e + 1));
     }
 
+    function normalizeImportedCards(cards, { includeDeleted = false } = {}) {
+      const legacyFallback = '1970-01-01T00:00:00.000Z';
+      const prepared = (Array.isArray(cards) ? cards : [])
+        .filter(card => card && typeof card === 'object' && card.id != null)
+        .map(card => ({
+          ...card,
+          created_at: card.created_at || card.createdAt || legacyFallback,
+          updated_at: card.updated_at || card.updatedAt || card.created_at || card.createdAt || legacyFallback
+        }));
+      return normalizeCards(prepared, { includeDeleted });
+    }
     function exportJSON(cards) {
-      const json = JSON.stringify({ version: 2, exported: new Date().toISOString(), count: cards.length, cards }, null, 2);
-      _download(new Blob([json], { type: 'application/json' }), 'usmle_backup.json');
+      const payload = {
+        version: 3,
+        app: 'Dr. Bugeon USMLE Wrong Answer Notebook',
+        exported: nowIso(),
+        count: cards.length,
+        cards: normalizeCards(cards),
+        tombstones: loadLocalTombstones(),
+        sync_meta: getLocalSyncMeta()
+      };
+      const json = JSON.stringify(payload, null, 2);
+      _download(new Blob([json], { type: 'application/json' }), `usmle_backup_${backupStamp()}.json`);
     }
     function exportExcel(cards) {
       const rows = cards.map(c => ({
@@ -641,7 +770,7 @@ const todayStr = () => {
 const isDue = c => !c.srs || !c.srs.dueDate || c.srs.dueDate <= todayStr();
 const wrongReasonOf = card => card?.wrongReason || '';
 const nextCueOf = card => card?.nextCue || '';
-const uid = () => Math.random().toString(36).slice(2, 10);
+const uid = () => (globalThis.crypto?.randomUUID ? globalThis.crypto.randomUUID() : `card_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`);
 function interleave(cards) {
   const g = {};
   cards.forEach(c => {
@@ -1224,18 +1353,22 @@ function DeveloperModal({
     text: '#e5edf7',
     dim: '#94a3b8'
   };
+  const currentFileName = (() => {
+    try { return decodeURIComponent(location.pathname.split('/').pop() || '현재 HTML 파일'); }
+    catch { return '현재 HTML 파일'; }
+  })();
   const info = [
     ['개발자', '김부건 (Kim Bugeon)'],
     ['소속', 'Tashkent State Medical University'],
     ['최초 개발일', '2026년 6월 8일'],
     ['앱 이름', 'Dr. Bugeon의 USMLE 오답노트'],
-    ['최근 수정', '2026년 6월 8일 · 개발자 정보창 추가'],
-    ['현재 파일명', '현재 HTML 파일']
+    ['최근 수정', '2026년 6월 9일 · 전수점검 및 동기화 보강'],
+    ['현재 파일명', currentFileName]
   ];
   const updates = [{
-    title: '최신 · 개발자 정보창 추가',
+    title: '최신 · 전수점검 및 동기화 보강',
     color: '#86efac',
-    items: ['우측 상단 개발자 버튼과 별도 정보창 추가', '다크 모달에 앱 색상 계열의 주황·청록 포인트 적용', '앱 목적과 최근 업데이트 이력을 한 화면에서 확인']
+    items: ['삭제 tombstone 오프라인 보존과 v3 JSON 백업 보강', '최종본 pending 잠금과 앱 전용 canonical_version 메타 적용', 'AI buzzword 배열 응답과 대량 upsert 처리 안정화']
   }, {
     title: '학습 흐름 개선',
     color: C.amber,
@@ -1475,7 +1608,7 @@ function App() {
           sbAutoSync(initial).then(synced => {
             setCards(synced.cards);
             saveStore(synced.cards);
-            showGlobalToast(synced.mode === 'canonical_pull' ? '클라우드 최종본 반영' : '자동 동기화 완료');
+            showGlobalToast(syncToastMessage(synced));
           }).catch(e => console.warn('Startup sync failed:', e.message));
         }
       } catch(e) {
@@ -1487,11 +1620,11 @@ function App() {
       }
     })();
   }, []);
-  const update = useCallback((next, deletedId = null) => {
+  const update = useCallback((next, deletedId = null, deletedCard = null) => {
     const clean = normalizeCards(next);
     setCards(clean);
     saveStore(clean);
-    if (deletedId) cloudDel(deletedId);
+    if (deletedId) cloudDel(deletedId, deletedCard);
   }, []);
   const flash = m => {
     setToast(m);
@@ -1782,7 +1915,7 @@ function Capture({
         trap: r.trap || p.trap,
         wrongReason: r.wrongReason || p.wrongReason,
         nextCue: r.nextCue || p.nextCue,
-        buzzword: r.buzzword || p.buzzword
+        buzzword: r.buzzword ? buzzwordText(r.buzzword) : p.buzzword
       }));
       flash('✨ AI 자동완성 완료');
     } catch (e) {
@@ -1807,7 +1940,7 @@ function Capture({
       trap: d.trap.trim(),
       wrongReason: d.wrongReason.trim(),
       nextCue: d.nextCue.trim(),
-      buzzword: d.buzzword.split(',').map(s => s.trim()).filter(Boolean),
+      buzzword: parseBuzzwordInput(d.buzzword),
       source: d.source.trim(),
       confidence: d.confidence,
       originalMcq: d.hasMcq ? {
@@ -2487,7 +2620,8 @@ function Library({
   }, [cards, search, sysFilter, etFilter, dueOnly, sort]);
   const del = id => {
     showConfirm('이 카드를 삭제할까요?', () => {
-      update(cards.filter(c => c.id !== id), id);
+      const target = cards.find(c => c.id === id);
+      update(cards.filter(c => c.id !== id), id, target);
       if (expanded === id) setExpanded(null);
       if (editing === id) {
         setEditing(null);
@@ -2507,7 +2641,7 @@ function Library({
       trap: card.trap || '',
       wrongReason: wrongReasonOf(card),
       nextCue: nextCueOf(card),
-      buzzword: (card.buzzword || []).join(', '),
+      buzzword: buzzwordText(card.buzzword || []),
       source: card.source || '',
       confidence: card.confidence || 3,
       hasMcq: !!card.originalMcq,
@@ -2532,7 +2666,7 @@ function Library({
         trap: r.trap || p.trap,
         wrongReason: r.wrongReason || p.wrongReason,
         nextCue: r.nextCue || p.nextCue,
-        buzzword: r.buzzword || p.buzzword
+        buzzword: r.buzzword ? buzzwordText(r.buzzword) : p.buzzword
       }));
       flash('✨ AI 자동완성 완료');
     } catch (e) {
@@ -2554,7 +2688,7 @@ function Library({
       trap: d.trap.trim(),
       wrongReason: d.wrongReason.trim(),
       nextCue: d.nextCue.trim(),
-      buzzword: d.buzzword.split(',').map(s => s.trim()).filter(Boolean),
+      buzzword: parseBuzzwordInput(d.buzzword),
       source: d.source.trim(),
       confidence: d.confidence,
       originalMcq: d.hasMcq ? {
@@ -3381,21 +3515,26 @@ function Export({
       reader.onload = ev => {
         try {
           const d = JSON.parse(ev.target.result);
-          const raw = d.cards || d;
+          const raw = Array.isArray(d) ? d : d.cards;
+          const rawTombstones = !Array.isArray(d) && Array.isArray(d.tombstones) ? d.tombstones : [];
           if (!Array.isArray(raw)) throw new Error('cards 배열 없음');
           // 카드 구조 검증 — 필수 필드 없으면 skip
           const imported = raw.filter(c =>
             c && typeof c === 'object' &&
-            typeof c.id === 'string' && c.id.length > 0 &&
+            c.id != null && String(c.id).trim().length > 0 &&
             typeof c.stem === 'string' &&
             typeof c.correct === 'string'
           );
           if (imported.length === 0) throw new Error('유효한 카드 데이터가 없습니다 (id·stem·correct 필드 필요)');
           const skipped = raw.length - imported.length;
           const skipMsg = skipped > 0 ? `<br><span style="color:#f97316;font-size:11px">⚠️ 구조 불일치 ${skipped}개 건너뜀</span>` : '';
-          const importedClean = normalizeCards(imported);
-          showConfirm(`JSON에서 ${importedClean.length}개 카드를 가져올까요?${skipMsg}<br><span style="font-size:11px;color:#64748b">기존 카드와 병합됩니다 (중복 ID는 updated_at 최신본 기준)</span>`, async () => {
-            const merged = mergeByUpdatedAt(cards, importedClean);
+          const importedClean = normalizeImportedCards(imported);
+          const importedDeleted = normalizeImportedCards(rawTombstones, { includeDeleted: true }).filter(card => card.deleted_at);
+          const tombMsg = importedDeleted.length > 0 ? `<br><span style="color:#64748b;font-size:11px">삭제 기록 ${importedDeleted.length}개도 함께 병합</span>` : '';
+          showConfirm(`JSON에서 ${importedClean.length}개 카드를 가져올까요?${skipMsg}${tombMsg}<br><span style="font-size:11px;color:#64748b">기존 카드와 병합됩니다 (중복 ID는 updated_at 최신본 기준)</span>`, async () => {
+            const mergedAll = mergeByUpdatedAt([...cards, ...loadLocalTombstones()], [...importedClean, ...importedDeleted], { includeDeleted: true });
+            const merged = normalizeCards(mergedAll);
+            saveLocalTombstones(mergedAll.filter(card => card.deleted_at));
             update(merged);
             flash(`JSON 가져오기 완료 · ${merged.length}개 카드`);
             if (getSbCfg()) {
@@ -3492,9 +3631,8 @@ function Settings({
       await sbTest();
       const synced = await sbAutoSync(cards);
       update(synced.cards);
-      const isCanonical = synced.mode === 'canonical_pull';
-      setSbStatus(isCanonical ? '✅ 연결 성공 · 클라우드 최종본 반영' : '✅ 연결 성공 · 자동 동기화 완료');
-      flash(isCanonical ? `클라우드 최종본 ${synced.count}개 반영` : `자동 동기화 완료 · ${synced.count}개`);
+      setSbStatus(syncStatusLine(synced));
+      flash(syncToastMessage(synced));
     } catch (e) {
       setSbStatus('❌ 연결 실패: ' + e.message);
       flash('연결 실패: ' + e.message);
@@ -3528,7 +3666,7 @@ function Settings({
     try {
       const cloudAll = await sbLoadAll({ includeDeleted: true }) || [];
       const cloudCards = normalizeCards(cloudAll);
-      const cloudVersion = await sbGetMeta('canonical_version').catch(() => null);
+      const cloudVersion = await sbGetCanonicalVersion(cloudAll.length > 0).catch(() => null);
       showConfirm(`클라우드 기준 ${cloudCards.length}개 카드로 맞출까요?<br><span style="font-size:11px;color:#9a9088">로컬 전용 항목은 보존하지 않고 교체합니다</span>`, () => {
         update(cloudCards);
         saveLocalTombstones(cloudAll.filter(card => card.deleted_at));
